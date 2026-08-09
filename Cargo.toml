@@ -1,0 +1,53 @@
+[package]
+name = "llm-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+formal = []
+
+[dependencies]
+getrandom = "0.3"
+anyhow = "1"
+async-stream = "0.3"
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+crossterm = "0.28"
+dirs = "6"
+fs2 = "0.4"
+futures-util = "0.3"
+globset = "0.4"
+hex = "0.4"
+httpdate = "1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+libc = "0.2"
+ratatui = "0.29"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+scopeguard = "1"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+toml = "0.9"
+toml_edit = "0.23"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[dev-dependencies]
+serial_test = "4.0.1"
+tempfile = "3"
