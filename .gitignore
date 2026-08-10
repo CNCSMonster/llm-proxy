@@ -1,0 +1,25 @@
+# Compiled binary
+/llm-proxy
+llm-proxy.exe
+
+# Build artifacts
+/build/
+/target/
+
+# Coverage output
+coverage.out
+cobertura.xml
+tarpaulin-report.html
+
+# Code review artifacts
+reviews/
+
+# Privacy protection - sensitive files
+oauth_accounts.json
+oauth_accounts.json.bak.*
+*.key
+*.pem
+*.p12
+*.pfx
+ENV-KEYS.md
+config.toml.backup
