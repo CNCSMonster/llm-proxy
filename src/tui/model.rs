@@ -9,8 +9,10 @@ use std::time::Instant;
 pub enum EntryMode {
     /// `connect` / `provider add` — product selection wizard
     Connect,
-    /// `provider` — full provider management TUI (future)
-    ProviderTui,
+    /// `provider` / `provider --select X` — provider list, or detail when `select` is set
+    ProviderTui { select: Option<String> },
+    /// `model` / `model --select X` — model list, or detail when `select` is set
+    ModelTui { select: Option<String> },
     /// `provider login <name>` — start at OAuth login for a specific provider
     OAuthLogin(String),
 }
@@ -47,51 +49,118 @@ pub struct AppModel {
     /// Cached ModelSelectionState when switching to FallbackConfig,
     /// so that `selected` and cursor position survive round-trips.
     pub cached_model_selection: Option<ModelSelectionState>,
+    /// Pending OAuth credential waiting for atomic commit with provider config.
+    pub pending_account: Option<crate::auth::PendingAccount>,
+    /// Endpoint-level filter from FallbackConfig: model_id → set of protocol
+    /// labels ("chat", "responses", "anthropic") the user selected.
+    /// After provider creation, bindings for unselected protocols are removed.
+    pub endpoint_filter:
+        Option<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+    /// Fallback target provider name from FallbackConfig (the provider being
+    /// backed up). After new provider creation, `add_fallback` inserts the new
+    /// provider into the target's model binding chains.
+    pub fallback_target: Option<String>,
+    /// Fallback binding specs: "model_id:protocol" pairs selected by the user
+    /// in FallbackConfig. Passed to `add_fallback` after provider creation.
+    pub fallback_bindings: Vec<String>,
+    /// OpenRouter 动态目录专用拉取与退避会话状态
+    pub openrouter_session: crate::connect::openrouter::OpenRouterConnectSession,
 }
 
 impl AppModel {
     pub fn new(config_path: PathBuf, entry_mode: EntryMode) -> Self {
-        let products = build_product_list();
+        let products = build_product_list(&config_path);
         let screen = match &entry_mode {
-            EntryMode::ProviderTui => {
-                // 加载已配置的 provider 列表
+            EntryMode::ProviderTui { select } => {
                 let providers = load_configured_providers(&config_path);
-                Screen::ProviderManagement(ProviderManagementState {
-                    providers,
-                    cursor: 0,
-                    filter: String::new(),
-                    filter_active: false,
-                    error: None,
-                })
-            }
-            EntryMode::OAuthLogin(provider_id) => {
-                // Find the product's auth type and start at the right screen
-                let product = products.iter().find(|p| p.id == *provider_id);
-                match product.map(|p| &p.auth_type) {
-                    Some(ProviderAuthType::OpenaiOauth) => {
-                        Screen::OAuthDeviceCode(OAuthDeviceCodeState {
-                            provider_name: provider_id.clone(),
-                            device_code: String::new(),
-                            verification_url: String::new(),
-                            expires_at: std::time::Instant::now()
-                                + std::time::Duration::from_secs(15 * 60),
-                            copied: false,
-                            polling: false,
-                            retry_count: 0,
-                            last_error: None,
-                            error: None,
-                        })
-                    }
-                    Some(ProviderAuthType::AntigravityOauth) => {
-                        Screen::AntigravityLogin(AntigravityLoginState::new(provider_id.clone()))
-                    }
-                    _ => Screen::ProductSelection(ProductSelectionState {
-                        items: products,
+                match select.as_deref() {
+                    Some(name) => match providers.iter().find(|provider| provider.name == name) {
+                        Some(provider) => Screen::ProviderDetail(build_provider_detail(
+                            &config_path,
+                            provider,
+                            None,
+                        )),
+                        None => Screen::ProviderManagement(ProviderManagementState {
+                            providers,
+                            cursor: 0,
+                            filter: String::new(),
+                            filter_active: false,
+                            error: Some(format!("unknown provider {name:?}")),
+                            scroll_offset: 0,
+                            quota_fetched_at: None,
+                        }),
+                    },
+                    None => Screen::ProviderManagement(ProviderManagementState {
+                        providers,
                         cursor: 0,
                         filter: String::new(),
                         filter_active: false,
                         error: None,
+                        scroll_offset: 0,
+                        quota_fetched_at: None,
                     }),
+                }
+            }
+            EntryMode::ModelTui { select } => {
+                let models = load_configured_models(&config_path);
+                match select.as_deref() {
+                    Some(name) => match models.iter().find(|model| model.id == name) {
+                        Some(item) => {
+                            Screen::ModelDetail(build_model_detail(&config_path, &item.id))
+                        }
+                        None => Screen::ModelManagement(ModelManagementState {
+                            models,
+                            cursor: 0,
+                            filter: String::new(),
+                            filter_active: false,
+                            error: Some(format!("unknown model {name:?}")),
+                            scroll_offset: 0,
+                        }),
+                    },
+                    None => Screen::ModelManagement(ModelManagementState {
+                        models,
+                        cursor: 0,
+                        filter: String::new(),
+                        filter_active: false,
+                        error: None,
+                        scroll_offset: 0,
+                    }),
+                }
+            }
+            EntryMode::OAuthLogin(provider_id) => {
+                let config_error = |message: String| {
+                    let mut device = OAuthDeviceCodeState::pending_login(provider_id.clone());
+                    device.error = Some(message);
+                    Screen::OAuthDeviceCode(device)
+                };
+                let config = match crate::config::Config::load(&config_path) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        return Self::with_initial_screen(
+                            config_path,
+                            entry_mode.clone(),
+                            config_error(format!("Failed to load config: {error}")),
+                        );
+                    }
+                };
+                let provider = match config.providers.get(provider_id) {
+                    Some(provider) => provider,
+                    None => {
+                        return Self::with_initial_screen(
+                            config_path,
+                            entry_mode.clone(),
+                            config_error(format!("Unknown provider {provider_id:?}")),
+                        );
+                    }
+                };
+                match provider.auth_config(provider_id) {
+                    Ok(crate::config::AuthConfig::OpenaiOauth { .. }) => Screen::OAuthDeviceCode(
+                        OAuthDeviceCodeState::pending_login(provider_id.clone()),
+                    ),
+                    Ok(_) => config_error(format!("Provider {provider_id:?} is not OAuth-backed")),
+                    Err(error) => {
+                        config_error(format!("Failed to load provider {provider_id:?}: {error}"))
+                    }
                 }
             }
             _ => Screen::ProductSelection(ProductSelectionState {
@@ -120,6 +189,38 @@ impl AppModel {
             width: 80,
             height: 24,
             cached_model_selection: None,
+            pending_account: None,
+            endpoint_filter: None,
+            fallback_target: None,
+            fallback_bindings: Vec::new(),
+            openrouter_session: Default::default(),
+        }
+    }
+
+    fn with_initial_screen(config_path: PathBuf, entry_mode: EntryMode, screen: Screen) -> Self {
+        Self {
+            config_path,
+            entry_mode,
+            screen,
+            session_results: Vec::new(),
+            chosen_product: None,
+            chosen_env_var: None,
+            chosen_models: Vec::new(),
+            custom_provider_type: None,
+            custom_provider_name: None,
+            custom_provider_endpoint: None,
+            oauth_provider_name: None,
+            is_repeat_connect: false,
+            last_esc: None,
+            esc_hint_visible: false,
+            width: 80,
+            height: 24,
+            cached_model_selection: None,
+            pending_account: None,
+            endpoint_filter: None,
+            fallback_target: None,
+            fallback_bindings: Vec::new(),
+            openrouter_session: Default::default(),
         }
     }
 
@@ -134,11 +235,15 @@ impl AppModel {
             Screen::OAuthName(s) => s.error.as_deref(),
             Screen::OAuthDeviceCode(s) => s.error.as_deref(),
             Screen::WarningConfirm(s) => s.error.as_deref(),
-            Screen::AntigravityLogin(s) => s.error.as_deref(),
             Screen::ResetUsageConfirm(s) => s.error.as_deref(),
             Screen::FallbackConfig(s) => s.error.as_deref(),
             Screen::CopyModelConfirm(s) => s.error.as_deref(),
+            Screen::CopyConfigure(s) => s.error.as_deref(),
             Screen::ModelRename(s) => s.error.as_deref(),
+            Screen::ModelManagement(s) => s.error.as_deref(),
+            Screen::ModelDetail(s) => s.error.as_deref(),
+            Screen::ModelDeleteConfirm(s) => s.error.as_deref(),
+            Screen::ProtocolBindingEditor(s) => s.error.as_deref(),
             _ => None,
         }
     }
@@ -150,14 +255,14 @@ impl AppModel {
                 if s.filter_active {
                     "[Esc] Cancel  [Enter] Confirm"
                 } else {
-                    "[/] Search  [a] Add  [d] Delete  [f] Fallback  [l] Login  [u] Usage  [R] Reset Usage  [r] Refresh  [Enter] Detail  [q] Quit"
+                    "[/] Search  [a] Add  [c] Copy  [m] Models  [e] Edit  [Enter] Detail  [q] Quit\n[d] Delete  [f] Fallback  [l] Login  [u] Usage  [R] Reset\n[r] Refresh  [W] Quota"
                 }
             }
             Screen::ProviderDetail(s) => {
                 if s.bound_models.is_empty() {
-                    "[e] Edit  [d] Delete  [Esc] Back"
+                    "[c] Copy  [m] Models  [e] Edit  [d] Delete  [Esc] Back"
                 } else {
-                    "[↑/↓] Select Model  [r] Rename  [e] Edit  [d] Delete  [Esc] Back"
+                    "[↑/↓] Select Model  [c] Copy  [m] Models  [r] Rename  [e] Edit  [d] Delete  [Esc] Back"
                 }
             }
             Screen::DeleteConfirm(_) => "[y] Confirm  [n] Cancel  [f] Force Delete",
@@ -179,14 +284,12 @@ impl AppModel {
                     "[e] Edit  [Enter] Confirm  [Esc] Back"
                 }
             }
+            Screen::ProbeConfirm(_) => "[↑/↓/j/k] Move  [Enter] Confirm  [n] Skip  [Esc] Back",
             Screen::Verifying(_) => "Verifying... please wait",
             Screen::WarningConfirm(_) => "[↑/↓/j/k] Move  [Enter] Confirm",
             Screen::Done(_) => "[Enter] Add Another  [q] Quit",
             Screen::OAuthName(_) => "[↑/↓/j/k] Move  [Enter] Confirm  [Esc] Back",
-            Screen::OAuthDeviceCode(_) => "[c] Copy  [o] Open Browser  [s] Stop  [Esc] Skip",
-            Screen::AntigravityLogin(_) => {
-                "[c] Copy URL  [o] Open Browser  [Enter] Submit  [Esc] Back"
-            }
+            Screen::OAuthDeviceCode(_) => "[r/Enter] 重试登录  [s] 停止  [Esc] 返回",
             Screen::FallbackConfig(s) => {
                 if s.focus == FallbackFocus::TargetProvider {
                     "[↑/↓/j/k] Move  [Tab] Switch to options  [Enter] Confirm  [M] Models  [Esc] Skip"
@@ -202,6 +305,18 @@ impl AppModel {
                     "[e] Edit ID  [Enter] Confirm copy  [Esc] Back"
                 }
             }
+            Screen::CopyConfigure(s) => match s.step {
+                CopyConfigureStep::Name if s.editing => "[Enter] Next  [Esc] Cancel edit",
+                CopyConfigureStep::Name => "[e] Edit  [Enter] Next  [Esc] Back",
+                CopyConfigureStep::Auth if s.env_editing => "[Enter] Confirm  [Esc] Cancel edit",
+                CopyConfigureStep::Auth => match s.auth_kind {
+                    CopyAuthKind::ApiKey => {
+                        "[e] Edit env  [s] No API key  [Enter] Confirm copy  [Esc] Back"
+                    }
+                    CopyAuthKind::None => "[Enter] Confirm copy  [Esc] Back",
+                    CopyAuthKind::OpenaiOauth => "[Enter] Copy and login  [Esc] Back",
+                },
+            },
             Screen::ModelRename(s) => {
                 if s.confirm_step == 0 {
                     if s.editing {
@@ -211,6 +326,36 @@ impl AppModel {
                     }
                 } else {
                     "[y] Confirm Rename  [n] Cancel"
+                }
+            }
+            Screen::ModelManagement(s) => {
+                if s.filter_active {
+                    "[Esc] Cancel  [Enter] Confirm"
+                } else {
+                    "[/] Search  [a] Add  [c] Copy  [r] Rename  [Enter] Detail  [q] Quit\n[d] Delete"
+                }
+            }
+            Screen::ModelDetail(s) => {
+                if s.editing {
+                    "[Enter] Confirm  [Esc] Cancel edit"
+                } else if s.is_draft() {
+                    "[↑/↓] Field  [Enter] Edit  [s] Save  [Esc] Cancel"
+                } else if s.is_routing_model {
+                    "[↑/↓] Field  [r] Rename  [Esc] Back"
+                } else {
+                    "[↑/↓] Field  [Enter] Edit  [r] Rename  [Esc] Back"
+                }
+            }
+            Screen::ModelDeleteConfirm(_) => "[y] Confirm  [n] Cancel",
+            Screen::ProtocolBindingEditor(s) => {
+                if s.remove_confirm {
+                    "[y] Remove  [n] Cancel"
+                } else if s.editing_upstream {
+                    "[Enter] Confirm  [Esc] Cancel edit"
+                } else if s.adding {
+                    "[↑/↓] Provider  [Enter] Add  [Esc] Cancel"
+                } else {
+                    "[a] Add  [e] Upstream  [K/J] Move  [d] Remove  [s] Save  [Esc] Back"
                 }
             }
             Screen::Quit => "",
@@ -233,11 +378,12 @@ pub enum Screen {
     ProductSelection(ProductSelectionState),
     EnvVarSelection(EnvVarSelectionState),
     ModelSelection(ModelSelectionState),
+    /// 探测确认屏：模型确认后、网络探测前，由用户选择是否探测（默认高亮「探测」）
+    ProbeConfirm(ProbeConfirmState),
     CustomProviderEditor(CustomProviderEditorState),
     ProviderNaming(ProviderNamingState),
     OAuthName(OAuthNameState),
     OAuthDeviceCode(OAuthDeviceCodeState),
-    AntigravityLogin(AntigravityLoginState),
     WarningConfirm(WarningConfirmState),
     Verifying(VerifyingState),
     OAuthOverwrite(OAuthOverwriteState),
@@ -246,8 +392,18 @@ pub enum Screen {
     FallbackConfig(FallbackConfigState),
     /// Model 复制确认界面
     CopyModelConfirm(CopyModelConfirmState),
+    /// Provider 复制配置界面
+    CopyConfigure(CopyConfigureState),
     /// Model 重命名界面
     ModelRename(ModelRenameState),
+    /// Model 管理主列表
+    ModelManagement(ModelManagementState),
+    /// Model 详情 / 新增 / 复制草稿
+    ModelDetail(ModelDetailState),
+    /// 删除模型确认
+    ModelDeleteConfirm(ModelDeleteConfirmState),
+    /// 单协议 Provider 绑定编辑器
+    ProtocolBindingEditor(ProtocolBindingEditorState),
     Quit,
 }
 
@@ -258,7 +414,6 @@ pub enum Screen {
 pub enum ProviderAuthType {
     ApiKey,
     OpenaiOauth,
-    AntigravityOauth,
     None,
 }
 
@@ -267,7 +422,6 @@ impl ProviderAuthType {
         match self {
             Self::ApiKey => "API Key",
             Self::OpenaiOauth => "OAuth",
-            Self::AntigravityOauth => "OAuth",
             Self::None => "None",
         }
     }
@@ -281,7 +435,6 @@ pub struct ProductItem {
     pub endpoint_count: usize,
     pub product_kind: String, // "payg", "subscription", "local", "custom"
     pub is_custom: bool,
-    pub auth_status: Option<String>, // "✓ Ready", "⚠ Not logged in", "⚠ Expired", etc.
 }
 
 // ── Provider Management States ───────────────────────────────────────────
@@ -299,6 +452,8 @@ pub struct ProviderListItem {
     pub status: ProviderStatus,
     /// 支持的协议列表
     pub protocols: Vec<String>,
+    /// 冷却状态（若存在任何未过期冷却，格式如 "until 2026-10-01 12:00"）
+    pub cooldown: Option<String>,
 }
 
 /// Provider 状态
@@ -309,6 +464,11 @@ pub enum ProviderStatus {
     Error,
 }
 
+/// Provider 管理列表的可视行数：终端高度扣除外边框(2)、帮助栏(2)、内边框(2)、表头(1)。
+pub fn provider_list_viewport(app_height: u16) -> usize {
+    app_height.saturating_sub(7) as usize
+}
+
 /// Provider 管理面板状态
 #[derive(Debug, Clone)]
 pub struct ProviderManagementState {
@@ -317,6 +477,10 @@ pub struct ProviderManagementState {
     pub filter: String,
     pub filter_active: bool,
     pub error: Option<String>,
+    /// 列表滚动窗口首行在 filtered_providers 中的下标，保证 cursor 始终可见。
+    pub scroll_offset: usize,
+    /// 上次配额刷新时间
+    pub quota_fetched_at: Option<std::time::SystemTime>,
 }
 
 impl ProviderManagementState {
@@ -330,6 +494,23 @@ impl ProviderManagementState {
             self.cursor += 1;
         }
         self.clear_success_message();
+    }
+
+    /// error 消息固定渲染在列表底部时占用的行数。
+    pub fn error_row_count(&self) -> usize {
+        usize::from(self.error.is_some())
+    }
+
+    /// 调整滚动窗口，使 cursor 始终落在可视区域内。
+    pub fn ensure_cursor_visible(&mut self, viewport: usize) {
+        if viewport == 0 {
+            return;
+        }
+        if self.cursor < self.scroll_offset {
+            self.scroll_offset = self.cursor;
+        } else if self.cursor >= self.scroll_offset.saturating_add(viewport) {
+            self.scroll_offset = self.cursor.saturating_add(1).saturating_sub(viewport);
+        }
     }
 
     /// 清除成功消息（以 "✓" 开头），保留错误消息供用户排查。
@@ -392,6 +573,10 @@ pub struct ProviderDetailState {
     pub compat_info: Vec<String>,
     /// 当前选中的模型光标（用于模型管理操作）
     pub model_cursor: usize,
+    /// 绑定模型列表的滚动窗口首行下标（"绑定模型"表头占第 0 行）
+    pub scroll_offset: usize,
+    /// 配额数据获取时间
+    pub quota_fetched_at: Option<std::time::SystemTime>,
 }
 
 impl ProviderDetailState {
@@ -412,6 +597,11 @@ impl ProviderDetailState {
     pub fn selected_model(&self) -> Option<&str> {
         self.bound_models.get(self.model_cursor).map(|s| s.as_str())
     }
+
+    /// 光标行在绑定模型列表内容中的下标（含表头行）。
+    pub fn cursor_line_index(&self) -> usize {
+        1 + self.model_cursor
+    }
 }
 
 /// Model rename 确认对话框状态
@@ -431,6 +621,8 @@ pub struct ModelRenameState {
     pub error: Option<String>,
     /// 触发重命名的 provider 名称（用于返回 ProviderDetail）
     pub provider_name: String,
+    /// 从 Model TUI 进入时，完成后回到模型列表
+    pub return_to_model_list: bool,
 }
 
 /// Endpoint 信息
@@ -493,36 +685,13 @@ impl ProductSelectionState {
         self.filter_active = false;
         self.filter.clear();
     }
+    /// 计数/下标走共享的 filtered_len/filtered_item_at，谓词与 widgets::product_list
+    /// 一致（product_filter_pred），保证状态层与渲染层是同一集合。
     fn filtered_count(&self) -> usize {
-        if self.filter.is_empty() {
-            self.items.len()
-        } else {
-            self.items
-                .iter()
-                .filter(|i| {
-                    i.display_name
-                        .to_lowercase()
-                        .contains(&self.filter.to_lowercase())
-                })
-                .count()
-        }
+        filtered_len(&self.items, &self.filter, product_filter_pred)
     }
     pub fn filtered_item(&self) -> Option<&ProductItem> {
-        let mut idx = 0usize;
-        for item in &self.items {
-            if self.filter.is_empty()
-                || item
-                    .display_name
-                    .to_lowercase()
-                    .contains(&self.filter.to_lowercase())
-            {
-                if idx == self.cursor {
-                    return Some(item);
-                }
-                idx += 1;
-            }
-        }
-        None
+        filtered_item_at(&self.items, &self.filter, self.cursor, product_filter_pred)
     }
 }
 
@@ -563,15 +732,13 @@ impl EnvVarSelectionState {
         self.filter_active = false;
         self.filter.clear();
     }
+    /// 计数/下标走共享的 filtered_len/filtered_item_at，谓词与 widgets::env_list
+    /// 一致（env_filter_pred：skip 项仅在无过滤时计入）。
     fn filtered_count(&self) -> usize {
-        if self.filter.is_empty() {
-            self.items.len()
-        } else {
-            self.items
-                .iter()
-                .filter(|i| i.name.to_lowercase().contains(&self.filter.to_lowercase()))
-                .count()
-        }
+        filtered_len(&self.items, &self.filter, env_filter_pred)
+    }
+    pub fn filtered_item(&self) -> Option<&EnvItem> {
+        filtered_item_at(&self.items, &self.filter, self.cursor, env_filter_pred)
     }
 }
 
@@ -579,9 +746,33 @@ impl EnvVarSelectionState {
 pub struct ModelItem {
     pub id: String,
     pub display_name: String,
-    pub context_window: i64,
-    pub max_output_tokens: i64,
-    pub supports_image: bool,
+    /// 上下文窗口。`None` = 目录未声明（宁缺毋假，不虚构默认值）。
+    pub context_window: Option<i64>,
+    /// 最大输出 token。`None` = 目录未声明。
+    pub max_output_tokens: Option<i64>,
+    /// 目录声明的能力（如 `image_input` / `tools`），视觉能力从中推导。
+    pub features: Vec<String>,
+    /// 目录声明的思考档位；空 = 未声明思考能力。
+    pub reasoning_levels: Vec<String>,
+    /// 目录声明的默认思考档位；仅当命中 `reasoning_levels` 时有意义。
+    pub default_reasoning_level: Option<String>,
+}
+
+impl ModelItem {
+    pub fn supports_image(&self) -> bool {
+        self.features.iter().any(|f| f == "image_input")
+    }
+
+    /// 有声明思考档位则展示思考标识。
+    pub fn has_thinking(&self) -> bool {
+        !self.reasoning_levels.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModelSelectionSource {
+    Connect,
+    ProviderReselect { provider_name: String },
 }
 
 #[derive(Debug, Clone)]
@@ -594,6 +785,10 @@ pub struct ModelSelectionState {
     pub configured: HashSet<String>,
     pub error: Option<String>,
     pub product_name: String,
+    pub source: ModelSelectionSource,
+    pub is_openrouter: bool,
+    pub is_degraded: bool,
+    pub openrouter_cached_at: Option<i64>,
 }
 
 impl ModelSelectionState {
@@ -613,19 +808,13 @@ impl ModelSelectionState {
         self.filter_active = false;
         self.filter.clear();
     }
+    /// 计数/下标走共享的 filtered_len/filtered_item_at，谓词与 widgets::model_list
+    /// 一致（model_filter_pred）。
     fn filtered_count(&self) -> usize {
-        if self.filter.is_empty() {
-            self.items.len()
-        } else {
-            self.items
-                .iter()
-                .filter(|i| {
-                    i.display_name
-                        .to_lowercase()
-                        .contains(&self.filter.to_lowercase())
-                })
-                .count()
-        }
+        filtered_len(&self.items, &self.filter, model_filter_pred)
+    }
+    pub fn filtered_item(&self) -> Option<&ModelItem> {
+        filtered_item_at(&self.items, &self.filter, self.cursor, model_filter_pred)
     }
 }
 
@@ -666,6 +855,8 @@ pub struct FallbackConfigState {
     pub skipped: bool,
     /// Where this screen was entered from (controls Esc/Enter behavior)
     pub source: FallbackSource,
+    /// 主内容区滚动窗口首行下标（目标 Provider 区 + options 区）
+    pub scroll_offset: usize,
 }
 
 /// Where the FallbackConfig screen was entered from.
@@ -689,6 +880,22 @@ pub enum FallbackFocus {
 }
 
 impl FallbackConfigState {
+    fn targets_block_lines(&self) -> usize {
+        if self.target_providers.is_empty() {
+            1 // "(无同产品的其他 Provider)" 占位行
+        } else {
+            self.target_providers.len()
+        }
+    }
+
+    /// 当前焦点光标在内容行中的下标（目标 Provider 区或 options 区）。
+    pub fn active_cursor_line(&self) -> usize {
+        match self.focus {
+            FallbackFocus::TargetProvider => self.target_cursor,
+            FallbackFocus::Options => self.targets_block_lines() + 2 + self.option_cursor,
+        }
+    }
+
     pub fn move_up(&mut self) {
         match self.focus {
             FallbackFocus::TargetProvider => {
@@ -1007,47 +1214,21 @@ pub struct OAuthDeviceCodeState {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct AntigravityLoginState {
-    pub provider_name: String,
-    pub auth_url: String,
-    /// PKCE code_verifier：进入屏幕时生成，用户提交 code 后用于 OAuth exchange。
-    pub verifier: String,
-    pub copied: bool,
-    pub input: String,
-    pub input_active: bool,
-    pub error: Option<String>,
-    /// 用户按 Enter 提交 code 后置 true，主循环据此用保存的 verifier 执行非交互式 exchange。
-    pub submitted: bool,
-}
-
-impl AntigravityLoginState {
-    /// 进入登录屏时生成 PKCE verifier + 授权 URL（自包含登录，不依赖 CLI 交互）。
-    pub fn new(provider_name: String) -> Self {
-        let (auth_url, verifier) = match crate::auth::generate_antigravity_auth_url() {
-            Ok(pair) => pair,
-            Err(err) => {
-                return Self {
-                    provider_name,
-                    auth_url: String::new(),
-                    verifier: String::new(),
-                    copied: false,
-                    input: String::new(),
-                    input_active: false,
-                    error: Some(format!("Failed to generate auth URL: {err}")),
-                    submitted: false,
-                };
-            }
-        };
+impl OAuthDeviceCodeState {
+    /// 构造"等待触发登录"的初始状态：空设备码 + 未轮询，主循环据此挂起 TUI
+    /// 调起真实 CLI 登录。统一构造入口，避免多处手工构造漂移出死状态
+    /// （历史上两处构造出假码 + polling=true 的占位，永远无法触发登录）。
+    pub fn pending_login(provider_name: String) -> Self {
         Self {
             provider_name,
-            auth_url,
-            verifier,
+            device_code: String::new(),
+            verification_url: String::new(),
+            expires_at: Instant::now() + std::time::Duration::from_secs(15 * 60),
             copied: false,
-            input: String::new(),
-            input_active: false,
+            polling: false,
+            retry_count: 0,
+            last_error: None,
             error: None,
-            submitted: false,
         }
     }
 }
@@ -1058,7 +1239,6 @@ pub struct WarningConfirmState {
     pub selected_option: WarningOption,
     pub back_to_product: bool, // true → Back 返回产品列表；false → 返回 EnvVarSelection
     pub error: Option<String>,
-    pub force_local: bool, // true → Continue 时强制本地写入（跳过 server 委托）
 }
 
 #[derive(Debug, Clone, PartialEq, Copy)]
@@ -1067,12 +1247,34 @@ pub enum WarningOption {
     Back,
 }
 
+/// 探测确认屏状态（ 方案 A）。
+///
+/// 位置：**本地 env var 存在性检查之后、网络有效性探测之前**。
+/// 两道检查正交——`require_auth_env` 管本地凭据，`skip_probe` 只管花钱的网络探测；
+/// 跳过探测不代表跳过凭据检查。
+#[derive(Debug, Clone)]
+pub struct ProbeConfirmState {
+    pub product_name: String,
+    pub models: Vec<String>,
+    /// 0 = 探测（默认），1 = 跳过探测
+    pub cursor: usize,
+}
+
+impl ProbeConfirmState {
+    pub fn probe_selected(&self) -> bool {
+        self.cursor == 0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VerifyingState {
     pub product_name: String,
     pub env_var: Option<String>,
     pub models: Vec<String>,
-    pub force_local: bool, // true → 强制本地写入（跳过 server 委托）
+    pub skip_probe: bool, // true → Continue 时跳过探针验证并统一调度
+    pub progress_done: usize,
+    pub progress_total: usize,
+    pub progress_current_model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1092,6 +1294,49 @@ pub struct ConfigResult {
     pub provider: String,
     pub success: bool,
     pub message: String,
+}
+
+// ── Copy Provider Configuration State ───────────────────────────────────
+
+/// Steps in the provider-copy configuration screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyConfigureStep {
+    /// Choose the new provider instance name.
+    Name,
+    /// Confirm API-key env, skip key, or acknowledge OAuth fresh-account login.
+    Auth,
+}
+
+/// Auth kind of the source provider being copied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyAuthKind {
+    ApiKey,
+    OpenaiOauth,
+    None,
+}
+
+/// State for the provider-copy configuration screen.
+/// Shown when the user presses `c` on a provider in the management list.
+#[derive(Debug, Clone)]
+pub struct CopyConfigureState {
+    pub source_id: String,
+    pub source_product: String,
+    pub source_auth_label: String,
+    pub source_endpoints: String,
+    pub auth_kind: CopyAuthKind,
+    pub default_name: String,
+    pub input: String,
+    pub editing: bool,
+    pub cursor_pos: usize,
+    pub validation: NameValidation,
+    pub step: CopyConfigureStep,
+    /// Source provider's existing env, if any. Shown for confirmation only.
+    pub source_api_key_env: Option<String>,
+    /// User-confirmed env var name. Empty until the user types or confirms.
+    pub env_input: String,
+    pub env_editing: bool,
+    pub env_cursor_pos: usize,
+    pub error: Option<String>,
 }
 
 // ── Copy Model Confirmation State ───────────────────────────────────────
@@ -1134,57 +1379,697 @@ pub fn generate_default_copy_id(
     format!("{}-copy", source_id)
 }
 
+#[derive(Debug, Clone)]
+pub struct ModelListItem {
+    pub id: String,
+    pub context_window: i64,
+    pub max_output_tokens: i64,
+    pub thinking: String,
+    pub features: String,
+    pub provider_count: usize,
+    /// Non-zero when this is a routing model, whose children are its
+    /// routes rather than provider bindings.
+    pub route_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelManagementState {
+    pub models: Vec<ModelListItem>,
+    pub cursor: usize,
+    pub filter: String,
+    pub filter_active: bool,
+    pub error: Option<String>,
+    /// 列表滚动窗口首行在 filtered_models 中的下标，保证 cursor 始终可见。
+    pub scroll_offset: usize,
+}
+
+/// Model 管理列表的可视行数：终端高度扣除外边框(2)、帮助栏(2)、内边框(2)、表头(1)。
+pub fn model_list_viewport(app_height: u16) -> usize {
+    app_height.saturating_sub(7) as usize
+}
+
+/// 详情/编辑器类屏幕的可视行数：终端高度扣除外边框(2)、帮助栏(1)、内边框(2)。
+pub fn detail_viewport(app_height: u16) -> usize {
+    app_height.saturating_sub(5) as usize
+}
+
+/// 通用滚动窗口跟随：保证 cursor_line 始终落在 [offset, offset+viewport) 内。
+pub(crate) fn follow_scroll(scroll_offset: &mut usize, cursor_line: usize, viewport: usize) {
+    if viewport == 0 {
+        return;
+    }
+    if cursor_line < *scroll_offset {
+        *scroll_offset = cursor_line;
+    } else if cursor_line >= scroll_offset.saturating_add(viewport) {
+        *scroll_offset = cursor_line + 1 - viewport;
+    }
+}
+
+/// 单项过滤判定：filter 为空时全量计入，否则由谓词决定。
+/// 空过滤语义与三个 widget 的渲染行为一致（skip 项仅在 env 带过滤时排除）。
+pub(crate) fn filter_match<T>(filter: &str, item: &T, pred: fn(&T, &str) -> bool) -> bool {
+    filter.is_empty() || pred(item, filter)
+}
+
+/// 过滤列表的通用计数。"过滤集合 ↔ 下标 ↔ 渲染"一致性的唯一实现点，
+/// 状态层与 widgets 层共用。
+pub(crate) fn filtered_len<T>(items: &[T], filter: &str, pred: fn(&T, &str) -> bool) -> usize {
+    items
+        .iter()
+        .filter(|i| filter_match(filter, *i, pred))
+        .count()
+}
+
+/// 过滤列表的通用下标访问：与 filtered_len 严格同一集合语义。
+pub(crate) fn filtered_item_at<'a, T>(
+    items: &'a [T],
+    filter: &str,
+    cursor: usize,
+    pred: fn(&T, &str) -> bool,
+) -> Option<&'a T> {
+    items
+        .iter()
+        .filter(|i| filter_match(filter, *i, pred))
+        .nth(cursor)
+}
+
+/// 三个选择列表各自的过滤谓词。谓词按界面各自演化（匹配字段、skip 特例），
+/// 因此保留为独立函数作为参数，与共享的计数/下标逻辑分离。
+pub(crate) fn product_filter_pred(item: &ProductItem, filter: &str) -> bool {
+    super::fuzzy::fuzzy_match(filter, &item.display_name)
+        || super::fuzzy::fuzzy_match(filter, &item.id)
+}
+
+pub(crate) fn env_filter_pred(item: &EnvItem, filter: &str) -> bool {
+    !item.is_skip && super::fuzzy::fuzzy_match(filter, &item.name)
+}
+
+pub(crate) fn model_filter_pred(item: &ModelItem, filter: &str) -> bool {
+    super::fuzzy::fuzzy_match(filter, &item.id)
+        || super::fuzzy::fuzzy_match(filter, &item.display_name)
+}
+
+impl ModelManagementState {
+    pub fn move_up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+        self.clear_success_message();
+    }
+
+    pub fn move_down(&mut self) {
+        if self.cursor < self.filtered_count().saturating_sub(1) {
+            self.cursor += 1;
+        }
+        self.clear_success_message();
+    }
+
+    /// error 消息固定渲染在列表底部时占用的行数。
+    pub fn error_row_count(&self) -> usize {
+        usize::from(self.error.is_some())
+    }
+
+    /// 调整滚动窗口，使 cursor 始终落在可视区域内。
+    pub fn ensure_cursor_visible(&mut self, viewport: usize) {
+        if viewport == 0 {
+            return;
+        }
+        if self.cursor < self.scroll_offset {
+            self.scroll_offset = self.cursor;
+        } else if self.cursor >= self.scroll_offset.saturating_add(viewport) {
+            self.scroll_offset = self.cursor.saturating_add(1).saturating_sub(viewport);
+        }
+    }
+
+    fn clear_success_message(&mut self) {
+        if self.error.as_deref().is_some_and(|e| e.starts_with('✓')) {
+            self.error = None;
+        }
+    }
+
+    pub fn selected_model(&self) -> Option<&ModelListItem> {
+        self.filtered_models().get(self.cursor).copied()
+    }
+
+    pub fn filtered_models(&self) -> Vec<&ModelListItem> {
+        if self.filter.is_empty() {
+            self.models.iter().collect()
+        } else {
+            let filter_lower = self.filter.to_lowercase();
+            self.models
+                .iter()
+                .filter(|item| {
+                    item.id.to_lowercase().contains(&filter_lower)
+                        || item.features.to_lowercase().contains(&filter_lower)
+                        || item.thinking.to_lowercase().contains(&filter_lower)
+                })
+                .collect()
+        }
+    }
+
+    pub fn filtered_count(&self) -> usize {
+        self.filtered_models().len()
+    }
+
+    pub fn activate_filter(&mut self) {
+        self.filter_active = true;
+    }
+
+    pub fn deactivate_filter(&mut self) {
+        self.filter_active = false;
+        self.filter.clear();
+        self.cursor = 0;
+        self.scroll_offset = 0;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelDetailKind {
+    Existing { original_id: String },
+    Add,
+    Copy { source_id: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelDetailField {
+    Id,
+    ContextWindow,
+    MaxOutput,
+    Thinking,
+    Features,
+    ChatBindings,
+    ResponsesBindings,
+    AnthropicBindings,
+    Routes,
+}
+
+impl ModelDetailField {
+    pub const ALL: [Self; 8] = [
+        Self::Id,
+        Self::ContextWindow,
+        Self::MaxOutput,
+        Self::Thinking,
+        Self::Features,
+        Self::ChatBindings,
+        Self::ResponsesBindings,
+        Self::AnthropicBindings,
+    ];
+
+    pub const ROUTING: [Self; 6] = [
+        Self::Id,
+        Self::ContextWindow,
+        Self::MaxOutput,
+        Self::Thinking,
+        Self::Features,
+        Self::Routes,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Id => "model_id",
+            Self::ContextWindow => "context_window",
+            Self::MaxOutput => "max_output_tokens",
+            Self::Thinking => "thinking",
+            Self::Features => "features",
+            Self::ChatBindings => "openai_chat_providers",
+            Self::ResponsesBindings => "openai_responses_providers",
+            Self::AnthropicBindings => "anthropic_providers",
+            Self::Routes => "reasoning_routes",
+        }
+    }
+
+    pub fn is_binding(self) -> bool {
+        matches!(
+            self,
+            Self::ChatBindings | Self::ResponsesBindings | Self::AnthropicBindings
+        )
+    }
+
+    pub fn protocol(self) -> Option<crate::config::Protocol> {
+        match self {
+            Self::ChatBindings => Some(crate::config::Protocol::OpenaiChatCompletions),
+            Self::ResponsesBindings => Some(crate::config::Protocol::OpenaiResponses),
+            Self::AnthropicBindings => Some(crate::config::Protocol::Anthropic),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelBindingPreview {
+    pub name: String,
+    pub upstream: String,
+    pub cooldown: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelRoutePreview {
+    pub level: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelDetailState {
+    pub kind: ModelDetailKind,
+    pub model_id: String,
+    pub context_window: String,
+    pub max_output_tokens: String,
+    pub thinking_enabled: bool,
+    pub default_reasoning_level: String,
+    pub supported_reasoning_levels: String,
+    pub features: String,
+    pub chat_bindings: Vec<ModelBindingPreview>,
+    pub responses_bindings: Vec<ModelBindingPreview>,
+    pub anthropic_bindings: Vec<ModelBindingPreview>,
+    pub routes: Vec<ModelRoutePreview>,
+    pub is_routing_model: bool,
+    pub cursor: usize,
+    pub editing: bool,
+    pub edit_buffer: String,
+    pub edit_cursor: usize,
+    pub error: Option<String>,
+    /// 内容滚动窗口首行下标（字段行 + 展开的绑定行）
+    pub scroll_offset: usize,
+}
+
+impl ModelDetailState {
+    pub fn is_draft(&self) -> bool {
+        !matches!(self.kind, ModelDetailKind::Existing { .. })
+    }
+
+    pub fn fields(&self) -> &[ModelDetailField] {
+        if self.is_routing_model {
+            &ModelDetailField::ROUTING
+        } else {
+            &ModelDetailField::ALL
+        }
+    }
+
+    pub fn selected_field(&self) -> ModelDetailField {
+        let fields = self.fields();
+        fields[self.cursor.min(fields.len().saturating_sub(1))]
+    }
+
+    pub fn move_up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+        self.error = None;
+    }
+
+    pub fn move_down(&mut self) {
+        let fields = self.fields();
+        if self.cursor < fields.len().saturating_sub(1) {
+            self.cursor += 1;
+        }
+        self.error = None;
+    }
+
+    fn bindings_len(&self, field: ModelDetailField) -> usize {
+        match field {
+            ModelDetailField::ChatBindings => self.chat_bindings.len(),
+            ModelDetailField::ResponsesBindings => self.responses_bindings.len(),
+            ModelDetailField::AnthropicBindings => self.anthropic_bindings.len(),
+            ModelDetailField::Routes => self.routes.len(),
+            _ => 0,
+        }
+    }
+
+    /// 当前字段在内容行中的下标（绑定字段会在自身行下展开 bindings.len() 行，routes 会展开 routes.len() 行）。
+    pub fn cursor_line_index(&self) -> usize {
+        let mut index = self.cursor;
+        for (i, field) in self.fields().iter().enumerate() {
+            if i >= self.cursor {
+                break;
+            }
+            if field.is_binding() || *field == ModelDetailField::Routes {
+                index += self.bindings_len(*field);
+            }
+        }
+        index
+    }
+
+    /// error 消息固定渲染在底部时占用的行数（空行 + 消息行）。
+    pub fn error_row_count(&self) -> usize {
+        if self.error.is_some() { 2 } else { 0 }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelDeleteConfirmState {
+    pub model_id: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BindingRow {
+    pub name: String,
+    pub upstream: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProtocolBindingEditorState {
+    pub model_id: String,
+    pub protocol: crate::config::Protocol,
+    pub rows: Vec<BindingRow>,
+    pub cursor: usize,
+    pub adding: bool,
+    pub candidates: Vec<String>,
+    pub candidate_cursor: usize,
+    pub editing_upstream: bool,
+    pub upstream_input: String,
+    pub upstream_cursor: usize,
+    pub remove_confirm: bool,
+    pub error: Option<String>,
+    /// 内容滚动窗口首行下标（rows 区 + adding 时的候选区）
+    pub scroll_offset: usize,
+}
+
+impl ProtocolBindingEditorState {
+    pub fn selected_row(&self) -> Option<&BindingRow> {
+        self.rows.get(self.cursor)
+    }
+
+    fn rows_line_count(&self) -> usize {
+        if self.rows.is_empty() {
+            1 // "(无绑定)" 占位行
+        } else {
+            self.rows.len()
+        }
+    }
+
+    /// 当前活动光标所在的内容行下标（adding 时为候选区，否则为 rows 区）。
+    pub fn active_cursor_line(&self) -> usize {
+        if self.adding {
+            self.rows_line_count() + 2 + self.candidate_cursor
+        } else if self.rows.is_empty() {
+            0
+        } else {
+            self.cursor
+        }
+    }
+
+    /// error 消息固定渲染在底部时占用的行数（空行 + 消息行）。
+    pub fn error_row_count(&self) -> usize {
+        if self.error.is_some() { 2 } else { 0 }
+    }
+}
+
+pub fn thinking_label(model: &crate::config::ModelConfig) -> String {
+    if model.force_no_think == Some(true) || model.supports_thinking == Some(false) {
+        return "off".to_string();
+    }
+    if let Some(level) = &model.default_reasoning_level {
+        return level.clone();
+    }
+    if model.default_think == Some(true)
+        || model.force_think == Some(true)
+        || model.supports_thinking == Some(true)
+        || !model.supported_reasoning_levels.is_empty()
+    {
+        return "on".to_string();
+    }
+    "off".to_string()
+}
+
+pub fn model_thinking_label(
+    cfg: &crate::config::Config,
+    id: &str,
+    model: &crate::config::ModelConfig,
+) -> String {
+    if model.is_routing_model() {
+        if let Some(level) = cfg.client_default_reasoning_level(id) {
+            return level;
+        }
+        if let Some(levels) = cfg.client_reasoning_levels(id)
+            && !levels.is_empty()
+        {
+            return "on".to_string();
+        }
+        return "off".to_string();
+    }
+    thinking_label(model)
+}
+
+pub fn load_configured_models(config_path: &std::path::Path) -> Vec<ModelListItem> {
+    let Ok(cfg) = crate::config::Config::load(config_path) else {
+        return Vec::new();
+    };
+    let mut models: Vec<ModelListItem> = cfg
+        .models
+        .iter()
+        .map(|(id, model)| {
+            let provider_count = crate::config::Protocol::CLIENT_PROTOCOLS
+                .into_iter()
+                .map(|protocol| model.provider_bindings(protocol).len())
+                .sum();
+            // a routing model declares no window or features of its own;
+            // derive client-visible capabilities from its targets.
+            let bounds = cfg.model_capability_bounds(id);
+            let (context_window, max_output_tokens) = bounds
+                .as_ref()
+                .map(|bounds| (bounds.context_window, bounds.max_output_tokens))
+                .unwrap_or((model.context_window, model.max_output_tokens));
+            let features = bounds
+                .as_ref()
+                .map(|b| b.features.join(","))
+                .unwrap_or_else(|| model.features.join(","));
+            let thinking = model_thinking_label(&cfg, id, model);
+            ModelListItem {
+                id: id.clone(),
+                context_window,
+                max_output_tokens,
+                thinking,
+                features,
+                provider_count,
+                route_count: model.routes().len(),
+            }
+        })
+        .collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models
+}
+
+fn binding_previews(
+    bindings: &[crate::config::ProviderBinding],
+    model_id: &str,
+    protocol: crate::config::Protocol,
+    cooldown_entries: &[crate::cooldown::CooldownEntry],
+    now: u64,
+) -> Vec<ModelBindingPreview> {
+    bindings
+        .iter()
+        .map(|binding| {
+            let cooldown = crate::cooldown::find_binding_cooldown(
+                cooldown_entries,
+                model_id,
+                &binding.name,
+                protocol,
+                now,
+            )
+            .map(|e| crate::cooldown::format_timestamp_local(e.expires_at_unix));
+            ModelBindingPreview {
+                name: binding.name.clone(),
+                upstream: binding.model.clone(),
+                cooldown,
+            }
+        })
+        .collect()
+}
+
+pub fn build_model_detail(config_path: &std::path::Path, model_id: &str) -> ModelDetailState {
+    let cfg = crate::config::Config::load(config_path).ok();
+    let model = cfg
+        .as_ref()
+        .and_then(|cfg| cfg.models.get(model_id))
+        .cloned();
+    match (cfg.as_ref(), model) {
+        (Some(cfg), Some(model)) => {
+            let detail_config_dir = config_path.parent().unwrap_or(std::path::Path::new("."));
+            let detail_dirs = crate::service::StateDirs::resolve(detail_config_dir);
+            let cooldown_entries =
+                crate::cooldown::read_entries(&detail_dirs.state_dir.join("cooldowns.json"))
+                    .unwrap_or_default();
+            let now = crate::cooldown::unix_secs();
+            let is_routing_model = model.is_routing_model();
+            let bounds = cfg.model_capability_bounds(model_id);
+            let context_window = bounds
+                .as_ref()
+                .map(|b| b.context_window)
+                .unwrap_or(model.context_window)
+                .to_string();
+            let max_output_tokens = bounds
+                .as_ref()
+                .map(|b| b.max_output_tokens)
+                .unwrap_or(model.max_output_tokens)
+                .to_string();
+            let features = bounds
+                .as_ref()
+                .map(|b| b.features.join(","))
+                .unwrap_or_else(|| model.features.join(","));
+
+            let (thinking_enabled, default_reasoning_level, supported_reasoning_levels) =
+                if is_routing_model {
+                    let client_levels = cfg
+                        .client_reasoning_levels(model_id)
+                        .map(|entries| {
+                            entries
+                                .into_iter()
+                                .map(|e| e.level().to_string())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let default_level = cfg
+                        .client_default_reasoning_level(model_id)
+                        .unwrap_or_default();
+                    let enabled = !client_levels.is_empty() || !default_level.is_empty();
+                    (enabled, default_level, client_levels.join(","))
+                } else {
+                    let enabled = model.force_no_think != Some(true)
+                        && model.supports_thinking != Some(false)
+                        && (model.default_think == Some(true)
+                            || model.force_think == Some(true)
+                            || model.supports_thinking == Some(true)
+                            || model.default_reasoning_level.is_some()
+                            || !model.supported_reasoning_levels.is_empty());
+                    (
+                        enabled,
+                        model.default_reasoning_level.clone().unwrap_or_default(),
+                        model.supported_reasoning_levels.join(","),
+                    )
+                };
+
+            let routes = model
+                .routes()
+                .iter()
+                .map(|r| ModelRoutePreview {
+                    level: r.level.clone(),
+                    target: r.target.clone(),
+                })
+                .collect();
+
+            ModelDetailState {
+                kind: ModelDetailKind::Existing {
+                    original_id: model_id.to_string(),
+                },
+                model_id: model_id.to_string(),
+                context_window,
+                max_output_tokens,
+                thinking_enabled,
+                default_reasoning_level,
+                supported_reasoning_levels,
+                features,
+                chat_bindings: binding_previews(
+                    &model.openai_chat_providers,
+                    model_id,
+                    crate::config::Protocol::OpenaiChatCompletions,
+                    &cooldown_entries,
+                    now,
+                ),
+                responses_bindings: binding_previews(
+                    &model.openai_responses_providers,
+                    model_id,
+                    crate::config::Protocol::OpenaiResponses,
+                    &cooldown_entries,
+                    now,
+                ),
+                anthropic_bindings: binding_previews(
+                    &model.anthropic_providers,
+                    model_id,
+                    crate::config::Protocol::Anthropic,
+                    &cooldown_entries,
+                    now,
+                ),
+                routes,
+                is_routing_model,
+                cursor: 0,
+                editing: false,
+                edit_buffer: String::new(),
+                edit_cursor: 0,
+                error: None,
+                scroll_offset: 0,
+            }
+        }
+        _ => ModelDetailState {
+            kind: ModelDetailKind::Add,
+            model_id: String::new(),
+            context_window: "128000".to_string(),
+            max_output_tokens: "8192".to_string(),
+            thinking_enabled: false,
+            default_reasoning_level: String::new(),
+            supported_reasoning_levels: String::new(),
+            features: String::new(),
+            chat_bindings: Vec::new(),
+            responses_bindings: Vec::new(),
+            anthropic_bindings: Vec::new(),
+            routes: Vec::new(),
+            is_routing_model: false,
+            cursor: 0,
+            editing: true,
+            edit_buffer: String::new(),
+            edit_cursor: 0,
+            error: Some(format!("unknown model {model_id:?}")),
+            scroll_offset: 0,
+        },
+    }
+}
+
+pub fn build_add_model_detail() -> ModelDetailState {
+    ModelDetailState {
+        kind: ModelDetailKind::Add,
+        model_id: String::new(),
+        context_window: "128000".to_string(),
+        max_output_tokens: "8192".to_string(),
+        thinking_enabled: false,
+        default_reasoning_level: String::new(),
+        supported_reasoning_levels: String::new(),
+        features: String::new(),
+        chat_bindings: Vec::new(),
+        responses_bindings: Vec::new(),
+        anthropic_bindings: Vec::new(),
+        routes: Vec::new(),
+        is_routing_model: false,
+        cursor: 0,
+        editing: true,
+        edit_buffer: String::new(),
+        edit_cursor: 0,
+        error: None,
+        scroll_offset: 0,
+    }
+}
+
+pub fn build_copy_model_detail(
+    config_path: &std::path::Path,
+    source_id: &str,
+) -> Option<ModelDetailState> {
+    let cfg = crate::config::Config::load(config_path).ok()?;
+    let source_model = cfg.models.get(source_id)?;
+    if source_model.is_routing_model() {
+        return None;
+    }
+    let mut state = build_model_detail(config_path, source_id);
+    state.kind = ModelDetailKind::Copy {
+        source_id: source_id.to_string(),
+    };
+    state.model_id = generate_default_copy_id(source_id, &cfg.models);
+    state.cursor = 0;
+    state.editing = true;
+    state.edit_buffer = state.model_id.clone();
+    state.edit_cursor = state.edit_buffer.len();
+    state.error = None;
+    Some(state)
+}
+
 // ── Product List Builder ─────────────────────────────────────────────────
 
-pub fn build_product_list() -> Vec<ProductItem> {
+pub fn build_product_list(_config_path: &std::path::Path) -> Vec<ProductItem> {
     let entries = crate::catalog::built_in_providers();
-
-    // 尝试加载 OAuth 账号
-    let accounts = crate::auth::load_oauth_accounts(&crate::auth::default_state_path())
-        .ok()
-        .map(|(a, _)| a);
 
     let mut items: Vec<ProductItem> = entries
         .iter()
         .map(|entry| {
             let auth_type = match entry.provider.auth_config(entry.id) {
                 Ok(crate::config::AuthConfig::OpenaiOauth { .. }) => ProviderAuthType::OpenaiOauth,
-                Ok(crate::config::AuthConfig::AntigravityOauth { .. }) => {
-                    ProviderAuthType::AntigravityOauth
-                }
                 Ok(crate::config::AuthConfig::ApiKeyEnv { .. }) => ProviderAuthType::ApiKey,
                 Ok(crate::config::AuthConfig::None) => ProviderAuthType::None,
                 Err(_) => ProviderAuthType::ApiKey,
-            };
-
-            // 获取认证状态
-            let auth_status = if let Some(ref accs) = accounts {
-                match crate::auth::get_provider_auth_status(&entry.provider, entry.id, accs) {
-                    crate::auth::ProviderAuthStatus::Ready => Some("✓ Ready".to_string()),
-                    crate::auth::ProviderAuthStatus::NotLoggedIn => {
-                        Some("⚠ Not logged in".to_string())
-                    }
-                    crate::auth::ProviderAuthStatus::Expired => Some("⚠ Login expired".to_string()),
-                    crate::auth::ProviderAuthStatus::MissingKey(env) => {
-                        Some(format!("✗ Missing {}", env))
-                    }
-                }
-            } else {
-                // 文件不存在，OAuth provider 显示未登录
-                match entry.provider.auth_config(entry.id) {
-                    Ok(crate::config::AuthConfig::OpenaiOauth { .. })
-                    | Ok(crate::config::AuthConfig::AntigravityOauth { .. }) => {
-                        Some("⚠ Not logged in".to_string())
-                    }
-                    Ok(crate::config::AuthConfig::ApiKeyEnv { env }) => {
-                        if std::env::var(&env).is_ok() {
-                            Some("✓ Ready".to_string())
-                        } else {
-                            Some(format!("✗ Missing {}", env))
-                        }
-                    }
-                    _ => None,
-                }
             };
 
             ProductItem {
@@ -1195,7 +2080,6 @@ pub fn build_product_list() -> Vec<ProductItem> {
                 product_kind: if matches!(
                     entry.provider.auth_config(entry.id),
                     Ok(crate::config::AuthConfig::OpenaiOauth { .. })
-                        | Ok(crate::config::AuthConfig::AntigravityOauth { .. })
                 ) {
                     "subscription"
                 } else if matches!(
@@ -1208,7 +2092,6 @@ pub fn build_product_list() -> Vec<ProductItem> {
                 }
                 .to_string(),
                 is_custom: false,
-                auth_status,
             }
         })
         .collect();
@@ -1230,7 +2113,6 @@ pub fn build_product_list() -> Vec<ProductItem> {
         endpoint_count: 0,
         product_kind: "custom".to_string(),
         is_custom: true,
-        auth_status: None,
     });
     items
 }
@@ -1242,7 +2124,6 @@ fn format_display_name(id: &str) -> String {
         "openai-sub" => "OpenAI Subscription".to_string(),
         "openrouter" => "OpenRouter".to_string(),
         "anthropic" => "Anthropic API".to_string(),
-        "google-antigravity" => "Google Antigravity".to_string(),
         "ollama" => "Ollama (Local)".to_string(),
         "kimi-platform-global" => "Kimi Open Platform".to_string(),
         "kimi-platform-cn" => "Kimi Open Platform CN".to_string(),
@@ -1265,16 +2146,16 @@ fn format_display_name(id: &str) -> String {
 
 /// Check if an OAuth token exists and is not expired.
 /// Returns Some(true) if valid, Some(false) if expired, None if not found.
-fn check_oauth_token(token_type: &str, account_id: &str) -> Option<bool> {
-    let path = crate::auth::default_state_path();
+fn check_oauth_token(
+    token_type: &str,
+    account_id: &str,
+    config_path: &std::path::Path,
+) -> Option<bool> {
+    let path = crate::auth::state_path_for_config(config_path);
     let (accounts, _skipped) = crate::auth::load_oauth_accounts(&path).ok()?;
     match token_type {
         "openai" => accounts
             .openai
-            .get(account_id)
-            .map(|entry| !entry.is_expired()),
-        "antigravity" => accounts
-            .antigravity
             .get(account_id)
             .map(|entry| !entry.is_expired()),
         _ => None,
@@ -1288,6 +2169,13 @@ pub fn load_configured_providers(config_path: &std::path::Path) -> Vec<ProviderL
         Err(_) => return Vec::new(),
     };
 
+    let providers_config_dir = config_path.parent().unwrap_or(std::path::Path::new("."));
+    let providers_dirs = crate::service::StateDirs::resolve(providers_config_dir);
+    let cooldown_entries =
+        crate::cooldown::read_entries(&providers_dirs.state_dir.join("cooldowns.json"))
+            .unwrap_or_default();
+    let now = crate::cooldown::unix_secs();
+
     let mut providers = Vec::new();
 
     for (name, provider) in &config.providers {
@@ -1298,9 +2186,6 @@ pub fn load_configured_providers(config_path: &std::path::Path) -> Vec<ProviderL
         let auth_type = match &provider.auth {
             Some(crate::config::AuthConfig::ApiKeyEnv { .. }) => "ApiKey".to_string(),
             Some(crate::config::AuthConfig::OpenaiOauth { .. }) => "OpenAI OAuth".to_string(),
-            Some(crate::config::AuthConfig::AntigravityOauth { .. }) => {
-                "Antigravity OAuth".to_string()
-            }
             Some(crate::config::AuthConfig::None) => "None".to_string(),
             None => {
                 // 检查是否有 api_key_env
@@ -1325,18 +2210,10 @@ pub fn load_configured_providers(config_path: &std::path::Path) -> Vec<ProviderL
             match &provider.auth {
                 Some(crate::config::AuthConfig::OpenaiOauth { account }) => {
                     let account_id = account.as_deref().unwrap_or(name);
-                    match check_oauth_token("openai", account_id) {
+                    match check_oauth_token("openai", account_id, config_path) {
                         Some(true) => ProviderStatus::Ok,
                         Some(false) => ProviderStatus::Warning, // expired
                         None => ProviderStatus::Error,          // not found
-                    }
-                }
-                Some(crate::config::AuthConfig::AntigravityOauth { account }) => {
-                    let account_id = account.as_deref().unwrap_or(name);
-                    match check_oauth_token("antigravity", account_id) {
-                        Some(true) => ProviderStatus::Ok,
-                        Some(false) => ProviderStatus::Warning,
-                        None => ProviderStatus::Error,
                     }
                 }
                 Some(crate::config::AuthConfig::ApiKeyEnv { env }) => {
@@ -1361,9 +2238,9 @@ pub fn load_configured_providers(config_path: &std::path::Path) -> Vec<ProviderL
         if provider.anthropic.is_some() {
             protocols.push("anthropic".to_string());
         }
-        if provider.antigravity.is_some() {
-            protocols.push("antigravity".to_string());
-        }
+
+        let cooldown = crate::cooldown::find_provider_cooldown(&cooldown_entries, name, now)
+            .map(|e| crate::cooldown::format_timestamp_local(e.expires_at_unix));
 
         providers.push(ProviderListItem {
             name: name.clone(),
@@ -1371,6 +2248,7 @@ pub fn load_configured_providers(config_path: &std::path::Path) -> Vec<ProviderL
             auth_type,
             status,
             protocols,
+            cooldown,
         });
     }
 
@@ -1379,9 +2257,119 @@ pub fn load_configured_providers(config_path: &std::path::Path) -> Vec<ProviderL
     providers
 }
 
+/// Build the provider detail screen used by Enter on the list and by `--select`.
+pub fn build_provider_detail(
+    config_path: &std::path::Path,
+    provider: &ProviderListItem,
+    quota_fetched_at: Option<std::time::SystemTime>,
+) -> ProviderDetailState {
+    let config = crate::config::Config::load(config_path).ok();
+
+    let mut endpoints = Vec::new();
+    let mut bound_models = Vec::new();
+    let mut compat_info = Vec::new();
+
+    if let Some(ref cfg) = config {
+        if let Some(pc) = cfg.providers.get(&provider.name) {
+            if let Some(ref ep) = pc.openai_chat {
+                endpoints.push(EndpointInfo {
+                    protocol: "chat".to_string(),
+                    url: ep.url.clone().unwrap_or_default(),
+                    kind: if ep.derive_from.is_some() {
+                        "derived".to_string()
+                    } else {
+                        "native".to_string()
+                    },
+                });
+            }
+            if let Some(ref ep) = pc.openai_responses {
+                endpoints.push(EndpointInfo {
+                    protocol: "responses".to_string(),
+                    url: ep
+                        .url
+                        .clone()
+                        .unwrap_or_else(|| ep.derive_from.clone().unwrap_or_default()),
+                    kind: if ep.derive_from.is_some() {
+                        "derived".to_string()
+                    } else {
+                        "native".to_string()
+                    },
+                });
+            }
+            if let Some(ref ep) = pc.anthropic {
+                endpoints.push(EndpointInfo {
+                    protocol: "anthropic".to_string(),
+                    url: ep
+                        .url
+                        .clone()
+                        .unwrap_or_else(|| ep.derive_from.clone().unwrap_or_default()),
+                    kind: if ep.derive_from.is_some() {
+                        "derived".to_string()
+                    } else {
+                        "native".to_string()
+                    },
+                });
+            }
+
+            if let Some(ref ep) = pc.openai_chat
+                && let Some(ref compat) = ep.compat
+            {
+                if let Some(ref tf) = compat.thinking_format {
+                    compat_info.push(format!("thinking_format: {}", tf));
+                }
+                if let Some(sre) = compat.supports_reasoning_effort {
+                    compat_info.push(format!("supports_reasoning_effort: {}", sre));
+                }
+                if let Some(ref mtf) = compat.max_tokens_field {
+                    compat_info.push(format!("max_tokens_field: {}", mtf));
+                }
+            }
+        }
+
+        for (model_id, model_config) in &cfg.models {
+            let has_binding = model_config
+                .openai_chat_providers
+                .iter()
+                .any(|p| p.name == provider.name)
+                || model_config
+                    .openai_responses_providers
+                    .iter()
+                    .any(|p| p.name == provider.name)
+                || model_config
+                    .anthropic_providers
+                    .iter()
+                    .any(|p| p.name == provider.name);
+
+            if has_binding {
+                bound_models.push(model_id.clone());
+            }
+        }
+    }
+
+    let auth_description = provider.auth_type.clone();
+    let auth_status = match provider.status {
+        ProviderStatus::Ok => "✓ 已配置".to_string(),
+        ProviderStatus::Warning => "⚠ 需要登录".to_string(),
+        ProviderStatus::Error => "✗ 错误".to_string(),
+    };
+
+    ProviderDetailState {
+        name: provider.name.clone(),
+        product: provider.product.clone(),
+        auth_description,
+        auth_status,
+        endpoints,
+        bound_models,
+        compat_info,
+        model_cursor: 0,
+        scroll_offset: 0,
+        quota_fetched_at,
+    }
+}
+
 /// 识别 provider 属于哪个产品
 fn identify_product(provider: &crate::config::ProviderConfig) -> String {
-    // 优先使用 product 字段（Phase 1 已添加）
+    // 优先使用 product 字段
     if !provider.is_custom_product() {
         return format_display_name(&provider.product);
     }
@@ -1403,9 +2391,6 @@ fn identify_product(provider: &crate::config::ProviderConfig) -> String {
         }
         if url.contains("api.anthropic.com") {
             return "Anthropic API".to_string();
-        }
-        if url.contains("googleapis.com") {
-            return "Google Antigravity".to_string();
         }
         if url.contains("api.moonshot.ai") {
             return "Kimi Open Platform".to_string();
@@ -1515,6 +2500,62 @@ pub fn is_provider_name_taken(
     name: &str,
 ) -> bool {
     providers.contains_key(name)
+}
+
+/// Build CopyConfigure state from a selected provider.
+pub fn build_copy_configure_state(
+    config_path: &std::path::Path,
+    source_id: &str,
+    source_product_display: &str,
+    source_auth_label: &str,
+) -> Option<CopyConfigureState> {
+    let config = crate::config::Config::load(config_path).ok()?;
+    let provider = config.providers.get(source_id)?;
+    let product_key = if provider.is_custom_product() {
+        source_id.to_string()
+    } else {
+        provider.product.clone()
+    };
+    let default_name = next_instance_id(&config.providers, &product_key);
+    let validation = if is_provider_name_taken(&config.providers, &default_name) {
+        NameValidation::Conflict
+    } else {
+        NameValidation::Available
+    };
+    let auth = provider.auth_config(source_id).ok()?;
+    let (auth_kind, source_api_key_env) = match auth {
+        crate::config::AuthConfig::ApiKeyEnv { env } => (CopyAuthKind::ApiKey, Some(env)),
+        crate::config::AuthConfig::OpenaiOauth { .. } => (CopyAuthKind::OpenaiOauth, None),
+        crate::config::AuthConfig::None => (CopyAuthKind::None, None),
+    };
+    let mut endpoints = Vec::new();
+    if provider.openai_chat.is_some() {
+        endpoints.push("chat");
+    }
+    if provider.openai_responses.is_some() {
+        endpoints.push("responses");
+    }
+    if provider.anthropic.is_some() {
+        endpoints.push("anthropic");
+    }
+    Some(CopyConfigureState {
+        source_id: source_id.to_string(),
+        source_product: source_product_display.to_string(),
+        source_auth_label: source_auth_label.to_string(),
+        source_endpoints: endpoints.join(" · "),
+        auth_kind,
+        default_name: default_name.clone(),
+        input: default_name,
+        editing: false,
+        cursor_pos: 0,
+        validation,
+        step: CopyConfigureStep::Name,
+        source_api_key_env: source_api_key_env.clone(),
+        env_input: source_api_key_env.unwrap_or_default(),
+        env_editing: false,
+        env_cursor_pos: 0,
+        error: None,
+    })
 }
 
 /// Check whether a product already has at least one provider in the config.
@@ -1663,6 +2704,155 @@ mod tests {
     }
 
     #[test]
+    fn provider_tui_select_opens_detail_for_known_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        crate::config::init_config(&path).unwrap();
+
+        let app = AppModel::new(
+            path.clone(),
+            EntryMode::ProviderTui {
+                select: Some("deepseek".into()),
+            },
+        );
+        match app.screen {
+            Screen::ProviderDetail(state) => {
+                assert_eq!(state.name, "deepseek");
+                assert!(!state.endpoints.is_empty());
+            }
+            other => panic!("expected provider detail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_tui_select_unknown_stays_on_list_with_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        crate::config::init_config(&path).unwrap();
+
+        let app = AppModel::new(
+            path,
+            EntryMode::ProviderTui {
+                select: Some("missing".into()),
+            },
+        );
+        match app.screen {
+            Screen::ProviderManagement(state) => {
+                assert!(
+                    state
+                        .error
+                        .as_deref()
+                        .is_some_and(|err| err.contains("unknown provider"))
+                );
+            }
+            other => panic!("expected provider list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_list_scroll_follows_cursor_down_and_up() {
+        let mut state = ModelManagementState {
+            models: Vec::new(),
+            cursor: 0,
+            filter: String::new(),
+            filter_active: false,
+            error: None,
+            scroll_offset: 0,
+        };
+        // viewport=5：cursor 移出窗口下沿时 offset 跟随
+        state.cursor = 5;
+        state.ensure_cursor_visible(5);
+        assert_eq!(state.scroll_offset, 1);
+        // 窗口内上移不动 offset
+        state.cursor = 4;
+        state.ensure_cursor_visible(5);
+        assert_eq!(state.scroll_offset, 1);
+        // 移出窗口上沿时 offset 跟随上移
+        state.cursor = 0;
+        state.ensure_cursor_visible(5);
+        assert_eq!(state.scroll_offset, 0);
+        // viewport 为 0 时不动作
+        state.scroll_offset = 3;
+        state.ensure_cursor_visible(0);
+        assert_eq!(state.scroll_offset, 3);
+    }
+
+    #[test]
+    fn provider_list_scroll_follows_cursor_down_and_up() {
+        let mut state = ProviderManagementState {
+            providers: Vec::new(),
+            cursor: 0,
+            filter: String::new(),
+            filter_active: false,
+            error: None,
+            scroll_offset: 0,
+            quota_fetched_at: None,
+        };
+        state.cursor = 5;
+        state.ensure_cursor_visible(5);
+        assert_eq!(state.scroll_offset, 1);
+        state.cursor = 4;
+        state.ensure_cursor_visible(5);
+        assert_eq!(state.scroll_offset, 1);
+        state.cursor = 0;
+        state.ensure_cursor_visible(5);
+        assert_eq!(state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn env_filter_excludes_skip_item_and_follows_render_predicate() {
+        let mut state = EnvVarSelectionState {
+            items: vec![
+                EnvItem {
+                    name: "SKIP_ME".to_string(),
+                    is_skip: true,
+                    recommended: false,
+                },
+                EnvItem {
+                    name: "MY_API_KEY".to_string(),
+                    is_skip: false,
+                    recommended: false,
+                },
+            ],
+            cursor: 0,
+            filter: String::new(),
+            filter_active: false,
+            error: None,
+            product_name: "test".to_string(),
+            env_in_use_warning: None,
+        };
+        // 无过滤：skip 项计入（与 env_list 一致）
+        assert!(state.filtered_item().is_some());
+
+        // 过滤激活：skip 项永不匹配；fuzzy 子串匹配正常项
+        state.filter = "api".to_string();
+        state.cursor = 0;
+        let item = state.filtered_item().expect("filtered item");
+        assert_eq!(item.name, "MY_API_KEY");
+
+        // 过滤无匹配时返回 None（调用方不得回退到未过滤下标）
+        state.filter = "zzz_no_match".to_string();
+        assert!(state.filtered_item().is_none());
+    }
+
+    #[test]
+    fn provider_management_help_is_split_and_keeps_core_actions_visible() {
+        let app = AppModel::new(
+            PathBuf::from("/tmp/llm-proxy-test-config.toml"),
+            EntryMode::ProviderTui { select: None },
+        );
+        let help = app.help_text();
+        let lines: Vec<_> = help.lines().collect();
+
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("[m] Models"));
+        assert!(lines[0].contains("[e] Edit"));
+        assert!(lines[0].contains("[Enter] Detail"));
+        assert!(lines[0].contains("[q] Quit"));
+        assert!(lines.iter().all(|line| line.len() <= 80));
+    }
+
+    #[test]
     fn identify_product_matches_anthropic_only_provider() {
         // 纯 Anthropic provider（无 openai_chat）不应再被标为 Custom
         let provider = ProviderConfig {
@@ -1670,15 +2860,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(identify_product(&provider), "Anthropic API");
-    }
-
-    #[test]
-    fn identify_product_matches_antigravity_only_provider() {
-        let provider = ProviderConfig {
-            antigravity: Some(endpoint("https://antigravity-pa.googleapis.com/...")),
-            ..Default::default()
-        };
-        assert_eq!(identify_product(&provider), "Google Antigravity");
     }
 
     #[test]
@@ -1958,6 +3139,7 @@ mod tests {
             error: None,
             skipped: false,
             source: FallbackSource::ConnectFlow,
+            scroll_offset: 0,
         };
 
         // Toggle first option
@@ -2008,6 +3190,7 @@ mod tests {
             error: None,
             skipped: false,
             source: FallbackSource::ConnectFlow,
+            scroll_offset: 0,
         };
 
         let selected = state.selected_options();
@@ -2040,6 +3223,7 @@ mod tests {
             error: None,
             skipped: false,
             source: FallbackSource::ConnectFlow,
+            scroll_offset: 0,
         };
 
         // Move down in target focus → target_cursor changes, option_cursor doesn't
@@ -2070,7 +3254,95 @@ mod tests {
             error: None,
             skipped: false,
             source: FallbackSource::ConnectFlow,
+            scroll_offset: 0,
         };
         assert_eq!(state.selected_target(), Some("deepseek-2"));
+    }
+
+    #[test]
+    fn routing_model_derives_capabilities_in_list_and_detail() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[server]
+listen = "127.0.0.1:18990"
+
+[providers.mock]
+api_key_env = "MOCK_API_KEY"
+
+[providers.mock.openai_chat]
+url = "http://127.0.0.1:18991/chat/completions"
+
+[models.target-low]
+context_window = 1000
+max_output_tokens = 100
+features = ["image_input", "tools"]
+default_reasoning_level = "low"
+
+[[models.target-low.reasoning_levels]]
+level = "low"
+api_value = "1000"
+
+[[models.target-low.openai_chat_providers]]
+name = "mock"
+model = "upstream-low"
+
+[models.target-high]
+context_window = 1000
+max_output_tokens = 100
+features = ["image_input", "tools"]
+default_reasoning_level = "high"
+
+[[models.target-high.reasoning_levels]]
+level = "high"
+api_value = "-1"
+
+[[models.target-high.openai_chat_providers]]
+name = "mock"
+model = "upstream-high"
+
+[models.router-lp]
+reasoning_routes = [
+    { level = "low", target = "target-low" },
+    { level = "high", target = "target-high" },
+]
+"#,
+        )
+        .expect("write config");
+
+        // 1. Check load_configured_models
+        let models = load_configured_models(&config_path);
+        let router = models
+            .iter()
+            .find(|m| m.id == "router-lp")
+            .expect("router-lp in list");
+        assert_eq!(router.context_window, 1000);
+        assert_eq!(router.max_output_tokens, 100);
+        assert_eq!(router.thinking, "low");
+        assert_eq!(router.features, "image_input,tools");
+        assert_eq!(router.provider_count, 0);
+        assert_eq!(router.route_count, 2);
+
+        // 2. Check build_model_detail
+        let detail = build_model_detail(&config_path, "router-lp");
+        assert!(detail.is_routing_model);
+        assert_eq!(detail.context_window, "1000");
+        assert_eq!(detail.max_output_tokens, "100");
+        assert!(detail.thinking_enabled);
+        assert_eq!(detail.default_reasoning_level, "low");
+        assert_eq!(detail.supported_reasoning_levels, "low,high");
+        assert_eq!(detail.features, "image_input,tools");
+        assert_eq!(detail.routes.len(), 2);
+        assert_eq!(detail.routes[0].level, "low");
+        assert_eq!(detail.routes[0].target, "target-low");
+        assert_eq!(detail.routes[1].level, "high");
+        assert_eq!(detail.routes[1].target, "target-high");
+        assert_eq!(detail.fields(), &ModelDetailField::ROUTING);
+        assert_eq!(detail.bindings_len(ModelDetailField::Routes), 2);
+
+        // 3. Check copy is rejected for routing model
+        assert!(build_copy_model_detail(&config_path, "router-lp").is_none());
     }
 }

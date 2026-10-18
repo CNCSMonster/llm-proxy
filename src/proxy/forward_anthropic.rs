@@ -2,100 +2,18 @@
 
 use super::*;
 
-pub(super) async fn forward_anthropic_via_antigravity(
-    state: &AppState,
-    plan: &crate::config::ExecutionPlan,
-    frontend_model: &str,
-    mut antigravity_body: Value,
-    stream_response: bool,
-    token: Option<String>,
-) -> Response {
-    // Re-inject cached thought_signatures into functionCall parts of the
-    // antigravity request (Anthropic ingress multi-turn parity with the
-    // Responses ingress path). The body shape matches: antigravity envelope
-    // with request.contents.
-    state.inject_thought_signatures(&mut antigravity_body);
-    let url = if stream_response && !plan.native_url.contains("alt=sse") {
-        format!("{}?alt=sse", plan.native_url)
-    } else {
-        plan.native_url.clone()
-    };
-    let mut req = state
-        .client
-        .post(&url)
-        .header("User-Agent", "antigravity/hub/2.2.1 darwin/arm64")
-        .json(&antigravity_body);
-    if let Some(token) = token {
-        req = req.bearer_auth(token);
-    }
-    let upstream = match send_upstream(state, plan, req).await {
-        Ok(resp) => resp,
-        Err(err) => return upstream_send_failure_response(err, anthropic_error),
-    };
-    if upstream.status().is_client_error() || upstream.status().is_server_error() {
-        return upstream_error_anthropic(upstream).await;
-    }
-    if stream_response {
-        antigravity_sse_to_anthropic_sse(
-            state,
-            upstream,
-            frontend_model.to_string(),
-            plan.provider_id.clone(),
-            plan.frontend_protocol.field_name().to_string(),
-        )
-        .await
-    } else {
-        let start_time = std::time::Instant::now();
-        let value = match upstream.json::<Value>().await {
-            Ok(value) => value,
-            Err(err) => {
-                return anthropic_error(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("invalid upstream JSON: {err}"),
-                );
-            }
-        };
-        let latency_ms = start_time.elapsed().as_millis() as i64;
-        if let Some(usage) = value
-            .get("usageMetadata")
-            .or_else(|| value.get("cpaUsageMetadata"))
-        {
-            let input_tokens = usage
-                .get("promptTokenCount")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-            let output_tokens = usage
-                .get("candidatesTokenCount")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-            state.record_usage(
-                frontend_model.to_string(),
-                plan.provider_id.clone(),
-                plan.frontend_protocol.field_name().to_string(),
-                input_tokens,
-                output_tokens,
-                Some(latency_ms),
-            );
-        }
-        // Collect functionCall thought_signatures for the next multi-turn
-        // request (parity with the Responses ingress non-streaming path).
-        state.collect_thought_signatures(&value);
-        Json(convert::antigravity_to_anthropic_response(
-            value,
-            frontend_model,
-        ))
-        .into_response()
-    }
-}
-
 pub(super) async fn forward_anthropic_via_responses(
     state: &AppState,
     plan: &crate::config::ExecutionPlan,
     frontend_model: &str,
+    exec_model: &str,
     mut responses_body: Value,
+    token: Option<&crate::token::auth::TokenContext>,
+    request_start: std::time::Instant,
 ) -> Response {
     // Invariant: client_wants_stream must be recorded before egress adaptation.
     let client_wants_stream = responses_body.get("stream").and_then(Value::as_bool) == Some(true);
+    apply_codex_service_tier(state, exec_model, &mut responses_body);
     convert::apply_responses_egress_compat(&mut responses_body, &plan.compat, plan.store);
     let req = state.client.post(&plan.native_url).json(&responses_body);
     let req = match apply_bearer_auth(state, plan, req, anthropic_error).await {
@@ -103,13 +21,38 @@ pub(super) async fn forward_anthropic_via_responses(
         Err(response) => return response,
     };
 
-    let upstream = match send_upstream(state, plan, req).await {
+    let upstream = match send_upstream(state, plan, req, client_wants_stream).await {
         Ok(resp) => resp,
-        Err(err) => return upstream_send_failure_response(err, anthropic_error),
+        Err(err) => {
+            record_send_failure(
+                state,
+                frontend_model,
+                plan,
+                "anthropic",
+                token,
+                request_start,
+                &err,
+            );
+            return upstream_send_failure_response(err, anthropic_error);
+        }
+    };
+    let ttfb_ms = if client_wants_stream {
+        None
+    } else {
+        Some(request_start.elapsed().as_millis() as u64)
     };
 
     if upstream.status().is_client_error() || upstream.status().is_server_error() {
-        return upstream_error_anthropic(upstream).await;
+        record_request_failure(
+            state,
+            frontend_model,
+            plan,
+            "anthropic",
+            token,
+            request_start,
+            "upstream_error",
+        );
+        return upstream_error_anthropic(state, token, frontend_model, upstream).await;
     }
 
     if client_wants_stream {
@@ -119,6 +62,9 @@ pub(super) async fn forward_anthropic_via_responses(
             frontend_model.to_string(),
             plan.provider_id.clone(),
             plan.frontend_protocol.field_name().to_string(),
+            token,
+            request_start,
+            plan.routed_target.clone(),
         )
         .await
     } else if plan.compat.effective_force_stream() {
@@ -130,7 +76,12 @@ pub(super) async fn forward_anthropic_via_responses(
                     frontend_model,
                     &plan.provider_id,
                     plan.frontend_protocol.field_name(),
-                    None,
+                    Some(request_start.elapsed().as_millis() as i64),
+                    token,
+                    true,
+                    0,
+                    ttfb_ms,
+                    plan.routed_target.clone(),
                 );
                 Json(convert::responses_to_anthropic_response(
                     value,
@@ -139,6 +90,15 @@ pub(super) async fn forward_anthropic_via_responses(
                 .into_response()
             }
             Err(err) => {
+                record_request_failure(
+                    state,
+                    frontend_model,
+                    plan,
+                    plan.frontend_protocol.field_name(),
+                    token,
+                    request_start,
+                    "invalid_json",
+                );
                 anthropic_error(StatusCode::BAD_GATEWAY, &format!("upstream failure: {err}"))
             }
         }
@@ -146,6 +106,15 @@ pub(super) async fn forward_anthropic_via_responses(
         let value = match upstream.json::<Value>().await {
             Ok(value) => value,
             Err(err) => {
+                record_request_failure(
+                    state,
+                    frontend_model,
+                    plan,
+                    "anthropic",
+                    token,
+                    request_start,
+                    "invalid_json",
+                );
                 return anthropic_error(
                     StatusCode::BAD_GATEWAY,
                     &format!("invalid upstream JSON: {err}"),
@@ -165,6 +134,8 @@ pub(super) async fn forward_anthropic_via_chat(
     plan: &crate::config::ExecutionPlan,
     frontend_model: &str,
     chat_body: Value,
+    token: Option<&crate::token::auth::TokenContext>,
+    request_start: std::time::Instant,
 ) -> Response {
     let stream_response = chat_body.get("stream").and_then(Value::as_bool) == Some(true);
     let req = state.client.post(&plan.native_url).json(&chat_body);
@@ -173,13 +144,38 @@ pub(super) async fn forward_anthropic_via_chat(
         Err(response) => return response,
     };
 
-    let upstream = match send_upstream(state, plan, req).await {
+    let upstream = match send_upstream(state, plan, req, stream_response).await {
         Ok(resp) => resp,
-        Err(err) => return upstream_send_failure_response(err, anthropic_error),
+        Err(err) => {
+            record_send_failure(
+                state,
+                frontend_model,
+                plan,
+                "anthropic",
+                token,
+                request_start,
+                &err,
+            );
+            return upstream_send_failure_response(err, anthropic_error);
+        }
+    };
+    let ttfb_ms = if stream_response {
+        None
+    } else {
+        Some(request_start.elapsed().as_millis() as u64)
     };
 
     if upstream.status().is_client_error() || upstream.status().is_server_error() {
-        return upstream_error_anthropic(upstream).await;
+        record_request_failure(
+            state,
+            frontend_model,
+            plan,
+            "anthropic",
+            token,
+            request_start,
+            "upstream_error",
+        );
+        return upstream_error_anthropic(state, token, frontend_model, upstream).await;
     }
 
     if stream_response {
@@ -189,20 +185,31 @@ pub(super) async fn forward_anthropic_via_chat(
             frontend_model.to_string(),
             plan.provider_id.clone(),
             plan.frontend_protocol.field_name().to_string(),
+            token,
+            request_start,
+            plan.routed_target.clone(),
         )
         .await
     } else {
-        let start_time = std::time::Instant::now();
         let value = match upstream.json::<Value>().await {
             Ok(value) => value,
             Err(err) => {
+                record_request_failure(
+                    state,
+                    frontend_model,
+                    plan,
+                    "anthropic",
+                    token,
+                    request_start,
+                    "invalid_json",
+                );
                 return anthropic_error(
                     StatusCode::BAD_GATEWAY,
                     &format!("invalid upstream JSON: {err}"),
                 );
             }
         };
-        let latency_ms = start_time.elapsed().as_millis() as i64;
+        let latency_ms = request_start.elapsed().as_millis() as i64;
 
         // Extract and record usage from chat response
         if let Some(usage) = value.get("usage") {
@@ -214,13 +221,38 @@ pub(super) async fn forward_anthropic_via_chat(
                 .get("completion_tokens")
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
-            state.record_usage(
+            let (cache_hit, cache_miss) = crate::usage_stats::extract_cache_tokens(usage);
+            let response_bytes = serde_json::to_vec(&value).map(|v| v.len()).unwrap_or(0) as u64;
+            // : detect truncation from Chat finish_reason.
+            let (truncated, truncation_reason) = value
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|c| c.first())
+                .and_then(|c| c.get("finish_reason"))
+                .and_then(Value::as_str)
+                .map(|r| match r {
+                    "length" => (true, Some("max_tokens")),
+                    "content_filter" => (true, Some("content_filter")),
+                    _ => (false, None),
+                })
+                .unwrap_or((false, None));
+            state.record_usage_with_status_and_target(
                 frontend_model.to_string(),
                 plan.provider_id.clone(),
                 "anthropic".to_string(),
                 input_tokens,
                 output_tokens,
                 Some(latency_ms),
+                cache_hit,
+                cache_miss,
+                token,
+                Some("completed"),
+                false,
+                response_bytes,
+                truncated,
+                truncation_reason,
+                ttfb_ms,
+                plan.routed_target.clone(),
             );
         }
 
@@ -233,6 +265,8 @@ pub(super) async fn forward_anthropic_native(
     plan: &crate::config::ExecutionPlan,
     frontend_model: &str,
     mut body: Value,
+    token: Option<&crate::token::auth::TokenContext>,
+    request_start: std::time::Instant,
 ) -> Response {
     if let Some(obj) = body.as_object_mut() {
         obj.insert("model".to_string(), json!(plan.upstream_model));
@@ -249,13 +283,38 @@ pub(super) async fn forward_anthropic_native(
         Err(response) => return response,
     };
 
-    let upstream = match send_upstream(state, plan, req).await {
+    let upstream = match send_upstream(state, plan, req, stream_response).await {
         Ok(resp) => resp,
-        Err(err) => return upstream_send_failure_response(err, anthropic_error),
+        Err(err) => {
+            record_send_failure(
+                state,
+                frontend_model,
+                plan,
+                "anthropic",
+                token,
+                request_start,
+                &err,
+            );
+            return upstream_send_failure_response(err, anthropic_error);
+        }
+    };
+    let ttfb_ms = if stream_response {
+        None
+    } else {
+        Some(request_start.elapsed().as_millis() as u64)
     };
 
     if upstream.status().is_client_error() || upstream.status().is_server_error() {
-        return upstream_error_anthropic(upstream).await;
+        record_request_failure(
+            state,
+            frontend_model,
+            plan,
+            "anthropic",
+            token,
+            request_start,
+            "upstream_error",
+        );
+        return upstream_error_anthropic(state, token, frontend_model, upstream).await;
     }
 
     if stream_response {
@@ -266,20 +325,31 @@ pub(super) async fn forward_anthropic_native(
             plan.provider_id.clone(),
             plan.frontend_protocol.field_name().to_string(),
             frontend_model.to_string(),
+            token,
+            request_start,
+            plan.routed_target.clone(),
         )
         .await
     } else {
-        let start_time = std::time::Instant::now();
         let mut value = match upstream.json::<Value>().await {
             Ok(value) => value,
             Err(err) => {
+                record_request_failure(
+                    state,
+                    frontend_model,
+                    plan,
+                    "anthropic",
+                    token,
+                    request_start,
+                    "invalid_json",
+                );
                 return anthropic_error(
                     StatusCode::BAD_GATEWAY,
                     &format!("invalid upstream JSON: {err}"),
                 );
             }
         };
-        let latency_ms = start_time.elapsed().as_millis() as i64;
+        let latency_ms = request_start.elapsed().as_millis() as i64;
 
         // Extract and record usage from anthropic response
         if let Some(usage) = value.get("usage") {
@@ -291,13 +361,31 @@ pub(super) async fn forward_anthropic_native(
                 .get("output_tokens")
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
-            state.record_usage(
+            let (cache_hit, cache_miss) = crate::usage_stats::extract_cache_tokens(usage);
+            let response_bytes = serde_json::to_vec(&value).map(|v| v.len()).unwrap_or(0) as u64;
+            // : detect truncation from Anthropic stop_reason.
+            let (truncated, truncation_reason) =
+                match value.get("stop_reason").and_then(Value::as_str) {
+                    Some("max_tokens") => (true, Some("max_tokens")),
+                    _ => (false, None),
+                };
+            state.record_usage_with_status_and_target(
                 frontend_model.to_string(),
                 plan.provider_id.clone(),
                 "anthropic".to_string(),
                 input_tokens,
                 output_tokens,
                 Some(latency_ms),
+                cache_hit,
+                cache_miss,
+                token,
+                Some("completed"),
+                false,
+                response_bytes,
+                truncated,
+                truncation_reason,
+                ttfb_ms,
+                plan.routed_target.clone(),
             );
         }
 

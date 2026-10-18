@@ -166,22 +166,33 @@ fn handle_step_confirm(app: &mut AppModel, key: KeyEvent) {
 
 /// Execute the actual model rename operation.
 fn perform_rename(app: &mut AppModel) {
-    let (old_model_id, new_model_id, provider_name) = if let Screen::ModelRename(ref s) = app.screen
-    {
-        (
-            s.old_model_id.clone(),
-            s.new_model_id.clone(),
-            s.provider_name.clone(),
-        )
-    } else {
-        return;
-    };
+    let (old_model_id, new_model_id, provider_name, return_to_model_list) =
+        if let Screen::ModelRename(ref s) = app.screen {
+            (
+                s.old_model_id.clone(),
+                s.new_model_id.clone(),
+                s.provider_name.clone(),
+                s.return_to_model_list,
+            )
+        } else {
+            return;
+        };
 
     let config_path = app.config_path.clone();
 
-    // Load config and perform the rename BEFORE the delegation call (editor pattern)
-    let mut config = match Config::load(&config_path) {
-        Ok(cfg) => cfg,
+    // Load config and perform the rename BEFORE the delegation call (editor
+    // pattern). Body and generation come from one read so the replace can be
+    // checked against what was actually edited (CAS).
+    let config_path_for_load = config_path.clone();
+    let config_dir_for_load = config_path_for_load
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let runtime_dir_for_load = crate::service::StateDirs::resolve(config_dir_for_load).runtime_dir;
+    let (mut config, base) = match crate::tui::run_async_sync(async move {
+        crate::admin_client::load_config_for_replace(&config_path_for_load, &runtime_dir_for_load)
+            .await
+    }) {
+        Ok(result) => result,
         Err(e) => {
             if let Screen::ModelRename(ref mut s) = app.screen {
                 s.error = Some(format!("加载配置失败: {}", e));
@@ -190,7 +201,8 @@ fn perform_rename(app: &mut AppModel) {
         }
     };
 
-    if let Err(e) = rename_model_in_config(&mut config, &old_model_id, &new_model_id) {
+    if let Err(e) = crate::model::rename_model_in_config(&mut config, &old_model_id, &new_model_id)
+    {
         if let Screen::ModelRename(ref mut s) = app.screen {
             s.error = Some(format!("重命名失败: {}", e));
             s.confirm_step = 0;
@@ -208,8 +220,10 @@ fn perform_rename(app: &mut AppModel) {
                 let config_path = config_path.clone();
                 let config = config.clone();
                 async move {
+                    let config_dir = config_path.parent().unwrap_or(std::path::Path::new("."));
+                    let runtime_dir = crate::service::StateDirs::resolve(config_dir).runtime_dir;
                     let _lock = crate::core::ConfigLock::acquire(
-                        &crate::service::state_dir(),
+                        &runtime_dir,
                         std::time::Duration::from_secs(5),
                     )?;
                     crate::config_edit::write_full_config(&config_path, &config)
@@ -218,7 +232,7 @@ fn perform_rename(app: &mut AppModel) {
             // Delegate: server running, send via UDS
             |server| {
                 let config = config.clone();
-                Box::pin(async move { server.config_update(&config).await.map(|_| ()) })
+                Box::pin(async move { server.config_update(&config, base).await.map(|_| ()) })
             },
         )
         .await
@@ -226,6 +240,16 @@ fn perform_rename(app: &mut AppModel) {
 
     match result {
         Ok(_) => {
+            if return_to_model_list {
+                super::model_mgmt::return_to_model_management_preserving_cursor(
+                    app,
+                    Some(&new_model_id),
+                );
+                if let Screen::ModelManagement(ref mut state) = app.screen {
+                    state.error = Some(format!("✓ 已重命名: {old_model_id} → {new_model_id}"));
+                }
+                return;
+            }
             // Success — return to ProviderDetail with the renamed model
             let provider_name_clone = provider_name.clone();
             // Reload the provider detail with updated models
@@ -262,9 +286,6 @@ fn perform_rename(app: &mut AppModel) {
                     Some(crate::config::AuthConfig::OpenaiOauth { .. }) => {
                         "OpenAI OAuth".to_string()
                     }
-                    Some(crate::config::AuthConfig::AntigravityOauth { .. }) => {
-                        "Antigravity OAuth".to_string()
-                    }
                     Some(crate::config::AuthConfig::None) | None => "None".to_string(),
                 };
                 let auth_status = "✓ 已配置".to_string();
@@ -278,6 +299,8 @@ fn perform_rename(app: &mut AppModel) {
                     bound_models,
                     compat_info: Vec::new(),
                     model_cursor,
+                    scroll_offset: 0,
+                    quota_fetched_at: None,
                 });
             }
 
@@ -300,58 +323,6 @@ fn perform_rename(app: &mut AppModel) {
     }
 }
 
-/// Perform the model rename operation on an in-memory config.
-/// This is the core logic that:
-/// 1. Moves the model entry from old key to new key
-/// 2. Updates all provider bindings that reference the old model ID
-fn rename_model_in_config(
-    config: &mut Config,
-    old_model_id: &str,
-    new_model_id: &str,
-) -> anyhow::Result<()> {
-    // Remove the old model entry
-    let model_config = config
-        .models
-        .remove(old_model_id)
-        .ok_or_else(|| anyhow::anyhow!("Model '{}' not found in config", old_model_id))?;
-
-    // Check for conflict
-    if config.models.contains_key(new_model_id) {
-        // Restore the old entry
-        config.models.insert(old_model_id.to_string(), model_config);
-        anyhow::bail!("Model '{}' already exists in config", new_model_id);
-    }
-
-    // Insert with new key
-    config.models.insert(new_model_id.to_string(), model_config);
-
-    // Update all provider bindings that reference the old model ID
-    for model in config.models.values_mut() {
-        update_provider_bindings(&mut model.openai_chat_providers, old_model_id, new_model_id);
-        update_provider_bindings(
-            &mut model.openai_responses_providers,
-            old_model_id,
-            new_model_id,
-        );
-        update_provider_bindings(&mut model.anthropic_providers, old_model_id, new_model_id);
-    }
-
-    Ok(())
-}
-
-/// Update provider bindings that reference the old model ID.
-fn update_provider_bindings(
-    bindings: &mut [crate::config::ProviderBinding],
-    old_model_id: &str,
-    new_model_id: &str,
-) {
-    for binding in bindings.iter_mut() {
-        if binding.model == old_model_id {
-            binding.model = new_model_id.to_string();
-        }
-    }
-}
-
 /// Display helper for old model ID (truncated if too long).
 fn old_model_id_display(id: &str) -> &str {
     id
@@ -365,15 +336,24 @@ mod tests {
 
     fn make_test_config() -> Config {
         let mut config = Config {
-            server: crate::config::ServerConfig {
+            server: Some(crate::config::ServerConfig {
                 listen: "127.0.0.1:8080".to_string(),
                 usage: Default::default(),
                 max_sse_buffer_bytes: 64 * 1024 * 1024,
                 max_output_items: 4096,
-            },
+                proxy: None,
+                require_auth: None,
+                auth_token: None,
+                auth_token_env: None,
+                management_port: None,
+            }),
+            remote: None,
             fallback: Default::default(),
             protection: Default::default(),
+            diagnostics: Default::default(),
             status: Default::default(),
+            codex: Default::default(),
+            launch: Default::default(),
             providers: BTreeMap::new(),
             models: BTreeMap::new(),
         };
@@ -384,9 +364,18 @@ mod tests {
             context_window: 100_000,
             max_output_tokens: 32_000,
             features: vec![],
+            reasoning_levels: None,
             supported_reasoning_levels: vec![],
+            cooldown: None,
+            reasoning_routes: None,
             default_reasoning_level: None,
+            supports_thinking: None,
+            force_think: None,
+            force_no_think: None,
+            default_think: None,
             enable_thinking: None,
+            chat_reasoning_off_format: None,
+            codex_service_tier: None,
             openai_chat_providers: vec![ProviderBinding {
                 name: "deepseek".to_string(),
                 model: "deepseek-chat".to_string(),
@@ -408,6 +397,20 @@ mod tests {
         model.openai_responses_providers = vec![];
         config.models.insert("referencing-model".to_string(), model);
 
+        config.codex.auto_review_model = Some("my-model".to_string());
+        config.codex.model_overrides.insert(
+            "my-model".to_string(),
+            crate::config::CodexModelOverride {
+                auto_review_model: "review-target".to_string(),
+            },
+        );
+        config.codex.model_overrides.insert(
+            "other-coding".to_string(),
+            crate::config::CodexModelOverride {
+                auto_review_model: "my-model".to_string(),
+            },
+        );
+
         config
     }
 
@@ -415,7 +418,7 @@ mod tests {
     fn rename_model_moves_entry_and_updates_bindings() {
         let mut config = make_test_config();
 
-        let result = rename_model_in_config(&mut config, "my-model", "renamed-model");
+        let result = crate::model::rename_model_in_config(&mut config, "my-model", "renamed-model");
         assert!(result.is_ok());
 
         // Old key should be gone
@@ -430,20 +433,35 @@ mod tests {
         // Provider bindings in referencing-model should be updated
         let referencing = config.models.get("referencing-model").unwrap();
         assert_eq!(referencing.openai_chat_providers[0].model, "renamed-model");
+
+        assert_eq!(
+            config.codex.auto_review_model.as_deref(),
+            Some("renamed-model")
+        );
+        assert!(!config.codex.model_overrides.contains_key("my-model"));
+        assert_eq!(
+            config.codex.model_overrides["renamed-model"].auto_review_model,
+            "review-target"
+        );
+        assert_eq!(
+            config.codex.model_overrides["other-coding"].auto_review_model,
+            "renamed-model"
+        );
     }
 
     #[test]
     fn rename_model_fails_if_old_not_found() {
         let mut config = make_test_config();
-        let result = rename_model_in_config(&mut config, "nonexistent", "new-name");
+        let result = crate::model::rename_model_in_config(&mut config, "nonexistent", "new-name");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not found"));
+        assert!(result.unwrap_err().to_string().contains("unknown model"));
     }
 
     #[test]
     fn rename_model_fails_if_new_already_exists() {
         let mut config = make_test_config();
-        let result = rename_model_in_config(&mut config, "my-model", "referencing-model");
+        let result =
+            crate::model::rename_model_in_config(&mut config, "my-model", "referencing-model");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));
         // Original should be restored

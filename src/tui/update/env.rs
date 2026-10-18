@@ -162,7 +162,8 @@ pub(crate) fn compute_env_warning(
     config_path: &std::path::Path,
 ) {
     state.env_in_use_warning = None;
-    if let Some(item) = state.items.get(state.cursor) {
+    // 用过滤后集合（与渲染/确认一致），filter 激活时 raw cursor 指向的是过滤结果
+    if let Some(item) = state.filtered_item() {
         if item.is_skip {
             return;
         }
@@ -278,17 +279,12 @@ pub(crate) fn handle_env_keys(app: &mut AppModel, key: KeyEvent) {
 }
 
 fn confirm_env_selection(app: &mut AppModel) {
-    let cursor = if let Screen::EnvVarSelection(ref s) = app.screen {
-        s.cursor
-    } else {
-        return;
-    };
+    // 必须用与渲染层一致的过滤列表取下标：filter 激活时光标指向过滤后集合，
+    // 直接 s.items[cursor] 会选中原数组里的另一条环境变量
     let env_var = if let Screen::EnvVarSelection(ref s) = app.screen {
-        let item = &s.items[cursor];
-        if item.is_skip {
-            None
-        } else {
-            Some(item.name.clone())
+        match s.filtered_item() {
+            Some(item) if !item.is_skip => Some(item.name.clone()),
+            _ => None,
         }
     } else {
         None
@@ -321,6 +317,75 @@ fn advance_from_env(app: &mut AppModel) {
     }
 
     // First-time connect: route to ModelSelection (or Verifying if no templates)
+    if product_id.as_deref() == Some("openrouter") {
+        let config_dir = app
+            .config_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        let state_dir = crate::service::StateDirs::resolve(config_dir).state_dir;
+        let now = chrono::Utc::now().timestamp();
+        let plan = crate::connect::openrouter::plan_catalog_fetch(
+            &state_dir,
+            &app.openrouter_session,
+            now,
+        );
+
+        let (items, is_degraded, cached_at) = match plan {
+            crate::connect::openrouter::CatalogFetchPlan::UseValidCache(raw) => {
+                let cache = crate::connect::openrouter::read_cache_file(&state_dir, now);
+                (
+                    crate::connect::openrouter::convert_raw_models_to_items(&raw),
+                    false,
+                    cache.map(|c| c.fetched_at),
+                )
+            }
+            crate::connect::openrouter::CatalogFetchPlan::UseDegradedCache {
+                models: raw, ..
+            } => {
+                let cache = crate::connect::openrouter::read_cache_file(&state_dir, now);
+                (
+                    crate::connect::openrouter::convert_raw_models_to_items(&raw),
+                    true,
+                    cache.map(|c| c.fetched_at),
+                )
+            }
+            crate::connect::openrouter::CatalogFetchPlan::NeedOnlineFetch => {
+                app.openrouter_session.loading = true;
+                let cache_opt = crate::connect::openrouter::read_cache_file(&state_dir, now);
+                let items = cache_opt
+                    .as_ref()
+                    .map(|c| crate::connect::openrouter::convert_raw_models_to_items(&c.models))
+                    .unwrap_or_default();
+                (items, false, cache_opt.map(|c| c.fetched_at))
+            }
+            crate::connect::openrouter::CatalogFetchPlan::BlockedByBackoffNoCache { .. } => {
+                (vec![], true, None)
+            }
+        };
+
+        let configured = if let Some(ref product) = app.chosen_product {
+            model::build_configured_set(&app.config_path, &product.id, &items)
+        } else {
+            HashSet::new()
+        };
+
+        app.screen = Screen::ModelSelection(model::ModelSelectionState {
+            items,
+            cursor: 0,
+            filter: String::new(),
+            filter_active: false,
+            selected: HashSet::new(),
+            configured,
+            error: None,
+            product_name,
+            source: model::ModelSelectionSource::Connect,
+            is_openrouter: true,
+            is_degraded,
+            openrouter_cached_at: cached_at,
+        });
+        return;
+    }
+
     let models = get_model_templates(product_id.as_deref());
 
     if models.is_empty() {
@@ -328,7 +393,10 @@ fn advance_from_env(app: &mut AppModel) {
             product_name,
             env_var: app.chosen_env_var.clone(),
             models: vec![],
-            force_local: false,
+            skip_probe: false,
+            progress_done: 0,
+            progress_total: 0,
+            progress_current_model: None,
         });
     } else {
         let configured = if let Some(ref product) = app.chosen_product {
@@ -345,6 +413,10 @@ fn advance_from_env(app: &mut AppModel) {
             configured,
             error: None,
             product_name,
+            source: model::ModelSelectionSource::Connect,
+            is_openrouter: false,
+            is_degraded: false,
+            openrouter_cached_at: None,
         });
     }
 }
@@ -368,30 +440,33 @@ pub(crate) fn build_fallback_state(app: &AppModel) -> FallbackConfigState {
             .filter(|name| name != &provider_name)
             .collect();
 
-    // Build (model, endpoint) options from actual config models (not just templates).
-    // This ensures custom models and user-added models are included.
+    // Build (model, endpoint) options from target providers' existing bindings.
+    // In the connect flow the new provider doesn't exist in config yet, so we
+    // check target providers (existing same-product providers) instead.
+    // In provider management flow, target providers are the fallback destinations.
     let config = crate::config::Config::load(&app.config_path).ok();
     let mut options = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     if let Some(ref cfg) = config {
         for (model_id, model_config) in &cfg.models {
             for protocol in crate::config::Protocol::CLIENT_PROTOCOLS {
                 let bindings = model_config.provider_bindings(protocol);
-                // Check if the current provider has a binding in this chain
-                let has_provider = bindings.iter().any(|b| b.name == provider_name);
-                if has_provider {
+                let has_target = bindings.iter().any(|b| target_providers.contains(&b.name));
+                if has_target {
                     let endpoint_label = match protocol {
                         crate::config::Protocol::OpenaiChatCompletions => "chat",
                         crate::config::Protocol::OpenaiResponses => "responses",
                         crate::config::Protocol::Anthropic => "anthropic",
-                        _ => continue,
                     };
-                    // Use model_id as display name (no catalog template available here)
-                    options.push(FallbackOption {
-                        model_id: model_id.clone(),
-                        model_display_name: model_id.clone(),
-                        endpoint: endpoint_label.to_string(),
-                        selected: false,
-                    });
+                    let key = (model_id.clone(), endpoint_label.to_string());
+                    if seen.insert(key) {
+                        options.push(FallbackOption {
+                            model_id: model_id.clone(),
+                            model_display_name: model_id.clone(),
+                            endpoint: endpoint_label.to_string(),
+                            selected: false,
+                        });
+                    }
                 }
             }
         }
@@ -406,6 +481,7 @@ pub(crate) fn build_fallback_state(app: &AppModel) -> FallbackConfigState {
         error: None,
         skipped: false,
         source: crate::tui::model::FallbackSource::ConnectFlow,
+        scroll_offset: 0,
     }
 }
 

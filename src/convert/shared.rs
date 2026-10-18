@@ -1,4 +1,7 @@
-use anyhow::Result;
+use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
 
 // anthropic_system_to_text moved here from chat_anthropic because both
@@ -33,11 +36,51 @@ pub(super) fn copy_field(
     }
 }
 
+/// Chat `max_completion_tokens` is the current name of `max_tokens`; when both
+/// are present the newer canonical name wins (registered in spec.md §6).
+pub(super) fn chat_max_tokens(obj: &Map<String, Value>) -> Option<&Value> {
+    [obj.get("max_completion_tokens"), obj.get("max_tokens")]
+        .into_iter()
+        .flatten()
+        .find(|value| !value.is_null())
+}
+
+/// Proxy-generated response IDs must carry the target protocol's prefix and be
+/// unique per response (spec.md §6 "Response ID and timestamp namespace
+/// sub-contract"); `prefix` includes its separator (`chatcmpl-`, `resp_`, …).
+pub(crate) fn new_scoped_id(prefix: &str) -> String {
+    format!("{prefix}{}", uuid::Uuid::new_v4().as_simple())
+}
+
+/// Unix seconds at the moment of response synthesis; `created`/`created_at`
+/// must never be a fabricated `0` (spec.md §6 rule 3).
+pub(crate) fn unix_now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// A placeholder event recorded when opt-in fills for missing history.
+#[derive(Debug, Clone)]
+pub struct PlaceholderEvent {
+    /// "missing_function_call_output" or "orphan_reasoning_discarded"
+    pub reason: &'static str,
+    /// The call_id for missing function_call_output; None for orphan reasoning.
+    pub call_id: Option<String>,
+}
+
 pub(super) fn append_responses_items_as_chat_messages(
     items: &[Value],
     messages: &mut Vec<Value>,
-) -> Result<()> {
+    placeholder_enabled: bool,
+    requires_reasoning: bool,
+) -> Result<Vec<PlaceholderEvent>> {
     let mut pending_tool_calls: Vec<Value> = Vec::new();
+    let mut pending_reasoning = String::new();
+    let mut seen_call_ids = HashSet::new();
+    let mut outstanding_call_ids: HashSet<&str> = HashSet::new();
+    let mut events: Vec<PlaceholderEvent> = Vec::new();
 
     for item in items {
         let Some(obj) = item.as_object() else {
@@ -46,14 +89,90 @@ pub(super) fn append_responses_items_as_chat_messages(
         let item_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
 
         match item_type {
-            "function_call" => {
-                let call_id = obj
-                    .get("call_id")
-                    .or_else(|| obj.get("id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("call_unknown");
-                let name = obj.get("name").and_then(Value::as_str).unwrap_or("unknown");
-                let arguments = normalize_arguments(obj.get("arguments"));
+            "reasoning" => {
+                let text = responses_history_reasoning(obj)?;
+                if text.is_empty() {
+                    continue;
+                }
+                // A new reasoning segment ends the preceding consecutive call group.
+                // Flush first so reasoning for that group cannot leak into the next one.
+                if flush_pending_tool_calls(
+                    messages,
+                    &mut pending_tool_calls,
+                    &mut pending_reasoning,
+                    requires_reasoning,
+                    placeholder_enabled,
+                )? {
+                    events.push(PlaceholderEvent {
+                        reason: "missing_reasoning_content",
+                        call_id: None,
+                    });
+                }
+                pending_reasoning.push_str(&text);
+            }
+            "function_call" | "shell_call" | "local_shell_call" => {
+                if pending_tool_calls.is_empty() && !outstanding_call_ids.is_empty() {
+                    if placeholder_enabled {
+                        // Generate placeholder outputs for outstanding call IDs
+                        for call_id in outstanding_call_ids.iter() {
+                            let placeholder_content = format!(
+                                "[placeholder: function_call_output missing for call_id={call_id}]"
+                            );
+                            messages.push(json!({
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": placeholder_content
+                            }));
+                            events.push(PlaceholderEvent {
+                                reason: "missing_function_call_output",
+                                call_id: Some(call_id.to_string()),
+                            });
+                            tracing::warn!(
+                                                           event = "placeholder_used",
+                                                           reason = "missing_function_call_output",
+                                                           call_id = %call_id,
+                            ": placeholder generated for missing function_call_output"
+                                                       );
+                        }
+                        outstanding_call_ids.clear();
+                    } else {
+                        bail!(
+                            "Responses history requires all tool outputs before a new call group"
+                        );
+                    }
+                }
+                // Keep the existing id-only compatibility, but never hide an invalid
+                // explicit call_id behind the independent Responses item id.
+                let id_field = if obj.contains_key("call_id") {
+                    "call_id"
+                } else {
+                    "id"
+                };
+                let call_id = responses_history_identity(obj, id_field)?;
+                if !seen_call_ids.insert(call_id) {
+                    bail!("Responses history contains a duplicate call ID");
+                }
+                outstanding_call_ids.insert(call_id);
+                let (name, arguments) = if item_type == "function_call" {
+                    let name = responses_history_identity(obj, "name")?;
+                    let arguments =
+                        obj.get("arguments")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Responses function_call.arguments must be a string"
+                                )
+                            })?;
+                    (name, arguments.to_owned())
+                } else {
+                    let action = obj
+                        .get("action")
+                        .filter(|value| value.is_object())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Responses shell call.action must be an object")
+                        })?;
+                    ("shell", action.to_string())
+                };
                 pending_tool_calls.push(json!({
                     "id": call_id,
                     "type": "function",
@@ -63,28 +182,43 @@ pub(super) fn append_responses_items_as_chat_messages(
                     }
                 }));
             }
-            "shell_call" | "local_shell_call" => {
-                let call_id = obj
-                    .get("call_id")
-                    .or_else(|| obj.get("id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("call_unknown");
-                let arguments = obj
-                    .get("action")
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "{}".to_string());
-                pending_tool_calls.push(json!({
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": "shell",
-                        "arguments": arguments
-                    }
-                }));
-            }
             "function_call_output" | "shell_call_output" | "local_shell_call_output" => {
-                flush_pending_tool_calls(messages, &mut pending_tool_calls);
-                let call_id = obj.get("call_id").and_then(Value::as_str).unwrap_or("");
+                // Orphan reasoning = reasoning with no pending tool calls to attach to.
+                // If pending_tool_calls is non-empty, the reasoning will be attached to
+                // the assistant message (legitimate). If empty, reasoning is orphan.
+                if !pending_reasoning.is_empty() && pending_tool_calls.is_empty() {
+                    if placeholder_enabled {
+                        // Discard orphan reasoning, record warning
+                        events.push(PlaceholderEvent {
+                            reason: "orphan_reasoning_discarded",
+                            call_id: None,
+                        });
+                        tracing::warn!(
+                            event = "placeholder_used",
+                            reason = "orphan_reasoning_discarded",
+                            ": orphan reasoning discarded before tool output"
+                        );
+                        pending_reasoning.clear();
+                    } else {
+                        bail!("Responses history has orphan reasoning before a tool output");
+                    }
+                }
+                if flush_pending_tool_calls(
+                    messages,
+                    &mut pending_tool_calls,
+                    &mut pending_reasoning,
+                    requires_reasoning,
+                    placeholder_enabled,
+                )? {
+                    events.push(PlaceholderEvent {
+                        reason: "missing_reasoning_content",
+                        call_id: None,
+                    });
+                }
+                let call_id = responses_history_identity(obj, "call_id")?;
+                if !outstanding_call_ids.remove(call_id) {
+                    bail!("Responses history tool output has no matching outstanding call ID");
+                }
                 let output = extract_tool_output(obj.get("output"));
                 messages.push(json!({
                     "role": "tool",
@@ -98,72 +232,340 @@ pub(super) fn append_responses_items_as_chat_messages(
                     .and_then(Value::as_str)
                     .map(|role| if role == "developer" { "system" } else { role })
                     .unwrap_or("user");
-                let content = responses_content_to_chat(obj.get("content"));
-                if role == "assistant" && is_empty_content(&content) {
+                let content = responses_content_to_chat(obj.get("content"))?;
+                if role == "assistant"
+                    && (is_empty_content(&content)
+                        || content.as_array().is_some_and(|parts| {
+                            parts
+                                .iter()
+                                .all(|part| part["type"] == "text" && part["text"] == "")
+                        }))
+                {
                     continue;
                 }
-                flush_pending_tool_calls(messages, &mut pending_tool_calls);
-                messages.push(json!({ "role": role, "content": content }));
+                if flush_pending_tool_calls(
+                    messages,
+                    &mut pending_tool_calls,
+                    &mut pending_reasoning,
+                    requires_reasoning,
+                    placeholder_enabled,
+                )? {
+                    events.push(PlaceholderEvent {
+                        reason: "missing_reasoning_content",
+                        call_id: None,
+                    });
+                }
+                let mut message = json!({ "role": role, "content": content });
+                if role == "assistant" {
+                    if !outstanding_call_ids.is_empty() {
+                        if placeholder_enabled {
+                            // Generate placeholder outputs for outstanding call IDs
+                            for call_id in outstanding_call_ids.iter() {
+                                let placeholder_content = format!(
+                                    "[placeholder: function_call_output missing for call_id={call_id}]"
+                                );
+                                messages.push(json!({
+                                    "role": "tool",
+                                    "tool_call_id": call_id,
+                                    "content": placeholder_content
+                                }));
+                                events.push(PlaceholderEvent {
+                                    reason: "missing_function_call_output",
+                                    call_id: Some(call_id.to_string()),
+                                });
+                                tracing::warn!(
+                                                                   event = "placeholder_used",
+                                                                   reason = "missing_function_call_output",
+                                                                   call_id = %call_id,
+                                ": placeholder generated for missing function_call_output"
+                                                               );
+                            }
+                            outstanding_call_ids.clear();
+                        } else {
+                            bail!(
+                                "Responses history requires all tool outputs before an assistant message"
+                            );
+                        }
+                    }
+                    let has_text = content.as_str().is_some_and(|text| !text.is_empty())
+                        || content.as_array().is_some_and(|parts| {
+                            parts.iter().any(|part| {
+                                part["type"] == "text"
+                                    && part["text"].as_str().is_some_and(|text| !text.is_empty())
+                            })
+                        });
+                    if has_text
+                        && attach_pending_reasoning(
+                            &mut message,
+                            &mut pending_reasoning,
+                            requires_reasoning,
+                            placeholder_enabled,
+                        )?
+                    {
+                        events.push(PlaceholderEvent {
+                            reason: "missing_reasoning_content",
+                            call_id: None,
+                        });
+                    }
+                } else if !pending_reasoning.is_empty() {
+                    if placeholder_enabled {
+                        // Discard orphan reasoning, record warning
+                        events.push(PlaceholderEvent {
+                            reason: "orphan_reasoning_discarded",
+                            call_id: None,
+                        });
+                        tracing::warn!(
+                            event = "placeholder_used",
+                            reason = "orphan_reasoning_discarded",
+                            ": orphan reasoning discarded before non-assistant message"
+                        );
+                        pending_reasoning.clear();
+                    } else {
+                        bail!(
+                            "Responses history has orphan reasoning before a non-assistant message"
+                        );
+                    }
+                }
+                messages.push(message);
             }
         }
     }
 
-    flush_pending_tool_calls(messages, &mut pending_tool_calls);
-    Ok(())
+    if !outstanding_call_ids.is_empty() {
+        if placeholder_enabled {
+            // Flush any pending tool calls first (they haven't been flushed yet
+            // since there were no outputs to trigger the flush)
+            if flush_pending_tool_calls(
+                messages,
+                &mut pending_tool_calls,
+                &mut pending_reasoning,
+                requires_reasoning,
+                placeholder_enabled,
+            )? {
+                events.push(PlaceholderEvent {
+                    reason: "missing_reasoning_content",
+                    call_id: None,
+                });
+            }
+            // Generate placeholder outputs for outstanding call IDs at end of history
+            for call_id in outstanding_call_ids.iter() {
+                let placeholder_content =
+                    format!("[placeholder: function_call_output missing for call_id={call_id}]");
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": placeholder_content
+                }));
+                events.push(PlaceholderEvent {
+                    reason: "missing_function_call_output",
+                    call_id: Some(call_id.to_string()),
+                });
+                tracing::warn!(
+                                   event = "placeholder_used",
+                                   reason = "missing_function_call_output",
+                                   call_id = %call_id,
+                ": placeholder generated for missing function_call_output at end of history"
+                               );
+            }
+            outstanding_call_ids.clear();
+        } else {
+            bail!("Responses history is missing tool outputs");
+        }
+    }
+    if !pending_reasoning.is_empty() {
+        if placeholder_enabled {
+            // Discard orphan reasoning at end of history
+            events.push(PlaceholderEvent {
+                reason: "orphan_reasoning_discarded",
+                call_id: None,
+            });
+            tracing::warn!(
+                event = "placeholder_used",
+                reason = "orphan_reasoning_discarded",
+                ": orphan reasoning discarded at end of history"
+            );
+            pending_reasoning.clear();
+        } else {
+            bail!("Responses history ends with orphan reasoning");
+        }
+    }
+    Ok(events)
 }
 
-pub(super) fn flush_pending_tool_calls(
+fn responses_history_identity<'a>(obj: &'a Map<String, Value>, field: &str) -> Result<&'a str> {
+    obj.get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Responses history {field} must be a non-empty string"))
+}
+
+fn responses_history_reasoning(obj: &Map<String, Value>) -> Result<String> {
+    match obj.get("summary") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(parts)) if parts.is_empty() => {}
+        _ => bail!("Responses reasoning summary must be empty for Chat conversion"),
+    }
+    match obj.get("encrypted_content") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(text)) if text.is_empty() => {}
+        _ => bail!("Responses reasoning encrypted_content must be empty for Chat conversion"),
+    }
+    let parts = match obj.get("content") {
+        None | Some(Value::Null) => return Ok(String::new()),
+        Some(Value::Array(parts)) => parts,
+        _ => bail!("Responses reasoning content must be an array"),
+    };
+    let mut text = String::new();
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) != Some("reasoning_text") {
+            bail!("Responses reasoning content must contain reasoning_text parts");
+        }
+        let part_text = part
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Responses reasoning_text.text must be a string"))?;
+        text.push_str(part_text);
+    }
+    Ok(text)
+}
+
+/// Attach pending reasoning to an assistant message, applying the
+/// behavior matrix based on `requires_reasoning` and `placeholder_enabled`.
+///
+/// Returns `Ok(true)` when a placeholder was injected (for event recording).
+///
+/// - Non-empty pending → always attach (existing behavior). Returns `Ok(false)`.
+/// - Empty pending + `!requires_reasoning` → omit field (existing behavior). Returns `Ok(false)`.
+/// - Empty pending + `requires_reasoning` + `placeholder_enabled` → inject placeholder. Returns `Ok(true)`.
+/// - Empty pending + `requires_reasoning` + `!placeholder_enabled` → bail with readable error.
+fn attach_pending_reasoning(
+    message: &mut Value,
+    pending_reasoning: &mut String,
+    requires_reasoning: bool,
+    placeholder_enabled: bool,
+) -> Result<bool> {
+    if !pending_reasoning.is_empty() {
+        message["reasoning_content"] = json!(std::mem::take(pending_reasoning));
+        return Ok(false);
+    }
+    // pending_reasoning is empty
+    if !requires_reasoning {
+        // Upstream doesn't check — omit field, no error.
+        return Ok(false);
+    }
+    // requires_reasoning is true
+    if placeholder_enabled {
+        // inject self-describing placeholder
+        message["reasoning_content"] =
+            json!("[placeholder: reasoning_content missing for assistant with tool_calls]");
+        tracing::warn!(
+            event = "placeholder_used",
+            reason = "missing_reasoning_content",
+            ": placeholder injected for missing reasoning_content on assistant with tool_calls"
+        );
+        return Ok(true);
+    }
+    // requires_reasoning=true, placeholder_enabled=false → local 400
+    bail!(
+        "reasoning_content required but missing in assistant history (provider requires reasoning_content on assistant messages)"
+    )
+}
+
+fn flush_pending_tool_calls(
     messages: &mut Vec<Value>,
     pending_tool_calls: &mut Vec<Value>,
-) {
+    pending_reasoning: &mut String,
+    requires_reasoning: bool,
+    placeholder_enabled: bool,
+) -> Result<bool> {
     if pending_tool_calls.is_empty() {
-        return;
+        return Ok(false);
     }
-    messages.push(json!({
+    let mut message = json!({
         "role": "assistant",
         "tool_calls": std::mem::take(pending_tool_calls)
-    }));
+    });
+    let placeholder_injected = attach_pending_reasoning(
+        &mut message,
+        pending_reasoning,
+        requires_reasoning,
+        placeholder_enabled,
+    )?;
+    messages.push(message);
+    Ok(placeholder_injected)
 }
 
-pub(super) fn responses_content_to_chat(content: Option<&Value>) -> Value {
+pub(super) fn responses_content_to_chat(content: Option<&Value>) -> Result<Value> {
     match content {
-        Some(Value::String(text)) => json!(text),
+        Some(Value::String(text)) => Ok(json!(text)),
         Some(Value::Array(parts)) => {
             let converted: Vec<Value> = parts
                 .iter()
-                .filter_map(|part| {
-                    let obj = part.as_object()?;
-                    match obj.get("type").and_then(Value::as_str).unwrap_or("") {
-                        "input_text" | "output_text" => obj
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .map(|text| json!({ "type": "text", "text": text })),
-                        "input_image" => obj
-                            .get("image_url")
-                            .and_then(Value::as_str)
-                            .map(|url| json!({ "type": "image_url", "image_url": { "url": url } })),
-                        _ => None,
-                    }
+                .filter_map(|part| match responses_part_to_chat_content(part) {
+                    Ok(Some(part)) => Some(Ok(part)),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error)),
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             if converted.len() == 1
                 && converted[0].get("type").and_then(Value::as_str) == Some("text")
             {
-                converted[0]
+                Ok(converted[0]
                     .get("text")
                     .cloned()
-                    .unwrap_or_else(|| json!(""))
+                    .unwrap_or_else(|| json!("")))
             } else if converted.is_empty() {
-                json!("")
+                Ok(json!(""))
             } else {
-                Value::Array(converted)
+                Ok(Value::Array(converted))
             }
         }
-        _ => json!(""),
+        _ => Ok(json!("")),
     }
 }
 
-pub(super) fn responses_items_to_anthropic_messages(items: &[Value]) -> Vec<Value> {
+fn responses_part_to_chat_content(part: &Value) -> Result<Option<Value>> {
+    let obj = part
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Responses content part must be an object"))?;
+    match obj.get("type").and_then(Value::as_str).unwrap_or("") {
+        "input_text" | "output_text" => Ok(Some(json!({
+            "type": "text",
+            "text": obj.get("text").and_then(Value::as_str).unwrap_or("")
+        }))),
+        "input_image" => match responses_image_url(obj)? {
+            Some(url) => Ok(Some(
+                json!({ "type": "image_url", "image_url": { "url": url } }),
+            )),
+            None => Ok(None),
+        },
+        "input_file" | "document" => Ok(None),
+        other => bail!("unsupported Responses content part type: {other}"),
+    }
+}
+
+fn responses_image_url(obj: &Map<String, Value>) -> Result<Option<&str>> {
+    let Some(image_url) = obj.get("image_url") else {
+        if obj.get("file_id").is_some() {
+            return Ok(None);
+        }
+        bail!("Responses input_image must contain image_url or file_id")
+    };
+    match image_url {
+        Value::String(url) if !url.is_empty() => Ok(Some(url)),
+        Value::Object(image) => image
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|url| !url.is_empty())
+            .map(Some)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Responses input_image.image_url.url must be a non-empty string")
+            }),
+        _ => bail!("Responses input_image.image_url must be a non-empty string or object with url"),
+    }
+}
+
+pub(super) fn responses_items_to_anthropic_messages(items: &[Value]) -> Result<Vec<Value>> {
     let mut messages = Vec::new();
     for item in items {
         let Some(obj) = item.as_object() else {
@@ -174,7 +576,7 @@ pub(super) fn responses_items_to_anthropic_messages(items: &[Value]) -> Vec<Valu
                 let role = obj.get("role").and_then(Value::as_str).unwrap_or("user");
                 messages.push(json!({
                     "role": if role == "assistant" { "assistant" } else { "user" },
-                    "content": responses_content_to_anthropic(obj.get("content"))
+                    "content": responses_content_to_anthropic(obj.get("content"))?
                 }));
             }
             "function_call" => messages.push(json!({
@@ -199,41 +601,50 @@ pub(super) fn responses_items_to_anthropic_messages(items: &[Value]) -> Vec<Valu
             _ => {}
         }
     }
-    messages
+    Ok(messages)
 }
 
-pub(super) fn responses_content_to_anthropic(content: Option<&Value>) -> Value {
+pub(super) fn responses_content_to_anthropic(content: Option<&Value>) -> Result<Value> {
     match content {
-        Some(Value::String(text)) => json!([{ "type": "text", "text": text }]),
-        Some(Value::Array(parts)) => Value::Array(
+        Some(Value::String(text)) => Ok(json!([{ "type": "text", "text": text }])),
+        Some(Value::Array(parts)) => Ok(Value::Array(
             parts
                 .iter()
-                .filter_map(|part| {
-                    let obj = part.as_object()?;
-                    match obj.get("type").and_then(Value::as_str).unwrap_or("") {
-                        "input_text" | "output_text" => obj
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .map(|text| json!({ "type": "text", "text": text })),
-                        "input_image" => obj.get("image_url").and_then(Value::as_str).map(|url| {
-                            json!({
-                                "type": "image",
-                                "source": image_url_to_anthropic_source(url)
-                            })
-                        }),
-                        "input_file" | "document" => responses_file_to_anthropic_document(obj),
-                        _ => None,
-                    }
+                .filter_map(|part| match responses_part_to_anthropic_content(part) {
+                    Ok(Some(part)) => Some(Ok(part)),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error)),
                 })
-                .collect(),
-        ),
-        _ => json!([{ "type": "text", "text": "" }]),
+                .collect::<Result<Vec<_>>>()?,
+        )),
+        _ => Ok(json!([{ "type": "text", "text": "" }])),
+    }
+}
+
+fn responses_part_to_anthropic_content(part: &Value) -> Result<Option<Value>> {
+    let obj = part
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Responses content part must be an object"))?;
+    match obj.get("type").and_then(Value::as_str).unwrap_or("") {
+        "input_text" | "output_text" => Ok(Some(json!({
+            "type": "text",
+            "text": obj.get("text").and_then(Value::as_str).unwrap_or("")
+        }))),
+        "input_image" => match responses_image_url(obj)? {
+            Some(url) => Ok(Some(json!({
+                "type": "image",
+                "source": image_url_to_anthropic_source(url)
+            }))),
+            None => Ok(None),
+        },
+        "input_file" | "document" => responses_file_to_anthropic_document(obj).map(Some),
+        other => bail!("unsupported Responses content part type: {other}"),
     }
 }
 
 pub(super) fn responses_output_message(text: &str) -> Value {
     json!({
-        "id": "msg_llm_proxy",
+        "id": new_scoped_id("msg_"),
         "type": "message",
         "role": "assistant",
         "status": "completed",
@@ -286,37 +697,55 @@ pub(super) fn image_url_to_anthropic_source(url: &str) -> Value {
     json!({ "type": "url", "url": url })
 }
 
-pub(super) fn responses_file_to_anthropic_document(obj: &Map<String, Value>) -> Option<Value> {
-    if let Some(file_data) = obj.get("file_data").and_then(Value::as_str) {
-        return Some(json!({
+pub(super) fn responses_file_to_anthropic_document(obj: &Map<String, Value>) -> Result<Value> {
+    let title = obj
+        .get("filename")
+        .or_else(|| obj.get("name"))
+        .cloned()
+        .unwrap_or_else(|| json!("document"));
+    if let Some(file_data) = obj
+        .get("file_data")
+        .and_then(Value::as_str)
+        .filter(|file_data| !file_data.is_empty())
+    {
+        return Ok(json!({
             "type": "document",
-            "source": file_data_to_anthropic_source(file_data),
-            "title": obj.get("filename").or_else(|| obj.get("name")).cloned().unwrap_or_else(|| json!("document"))
+            "source": file_data_to_anthropic_source(file_data)?,
+            "title": title
         }));
     }
-    if let Some(file_url) = obj.get("file_url").and_then(Value::as_str) {
-        return Some(json!({
+    if let Some(file_url) = obj
+        .get("file_url")
+        .and_then(Value::as_str)
+        .filter(|file_url| !file_url.is_empty())
+    {
+        return Ok(json!({
             "type": "document",
             "source": { "type": "url", "url": file_url },
-            "title": obj.get("filename").or_else(|| obj.get("name")).cloned().unwrap_or_else(|| json!("document"))
+            "title": title
         }));
     }
-    None
+    bail!("Responses input_file must contain a non-empty file_data or file_url")
 }
 
-pub(super) fn file_data_to_anthropic_source(file_data: &str) -> Value {
+pub(super) fn file_data_to_anthropic_source(file_data: &str) -> Result<Value> {
     if let Some(rest) = file_data.strip_prefix("data:") {
-        let (meta, data) = rest
-            .split_once(',')
-            .unwrap_or(("application/pdf;base64", rest));
+        let (meta, data) = rest.split_once(',').ok_or_else(|| {
+            anyhow::anyhow!("Responses input_file.file_data must be a complete data URL")
+        })?;
         let media_type = meta
             .split(';')
             .next()
             .filter(|media| !media.is_empty())
-            .unwrap_or("application/pdf");
-        return json!({ "type": "base64", "media_type": media_type, "data": data });
+            .ok_or_else(|| {
+                anyhow::anyhow!("Responses input_file.file_data must include a MIME type")
+            })?;
+        if data.is_empty() {
+            bail!("Responses input_file.file_data must have a non-empty payload")
+        }
+        return Ok(json!({ "type": "base64", "media_type": media_type, "data": data }));
     }
-    json!({ "type": "base64", "media_type": "application/pdf", "data": file_data })
+    Ok(json!({ "type": "base64", "media_type": "application/pdf", "data": file_data }))
 }
 
 pub(super) fn anthropic_source_to_openai_url(
@@ -339,6 +768,126 @@ pub(super) fn anthropic_source_to_openai_url(
         .unwrap_or(default_media_type);
     let data = source.get("data").and_then(Value::as_str).unwrap_or("");
     format!("data:{media_type};base64,{data}")
+}
+
+pub(super) fn strict_anthropic_image_source_to_openai_url(
+    source: Option<&Map<String, Value>>,
+) -> Result<String> {
+    let source =
+        source.ok_or_else(|| anyhow::anyhow!("Anthropic image source must be an object"))?;
+    match source.get("type").and_then(Value::as_str) {
+        Some("url") => source
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|url| !url.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Anthropic image source.url must be a non-empty string")
+            }),
+        Some("base64") => {
+            let media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .filter(|media_type| !media_type.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Anthropic image source.media_type must be a non-empty string")
+                })?;
+            let data = source
+                .get("data")
+                .and_then(Value::as_str)
+                .filter(|data| !data.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Anthropic image source.data must be a non-empty string")
+                })?;
+            Ok(format!("data:{media_type};base64,{data}"))
+        }
+        Some(other) => bail!("unsupported Anthropic image source type: {other}"),
+        None => bail!("Anthropic image source.type must be a string"),
+    }
+}
+
+pub(super) fn validate_anthropic_message_images(messages: Option<&Value>) -> Result<()> {
+    for message in messages.and_then(Value::as_array).into_iter().flatten() {
+        let Some(parts) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) == Some("image") {
+                strict_anthropic_image_source_to_openai_url(
+                    part.get("source").and_then(Value::as_object),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_anthropic_message_documents(messages: Option<&Value>) -> Result<()> {
+    for message in messages.and_then(Value::as_array).into_iter().flatten() {
+        let Some(parts) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) == Some("document") {
+                strict_anthropic_document_source(part.get("source").and_then(Value::as_object))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_anthropic_message_documents_for_chat(
+    messages: Option<&Value>,
+) -> Result<()> {
+    for message in messages.and_then(Value::as_array).into_iter().flatten() {
+        let Some(parts) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        if parts
+            .iter()
+            .any(|part| part.get("type").and_then(Value::as_str) == Some("document"))
+        {
+            bail!("Anthropic document content is unsupported for Chat Completions")
+        }
+    }
+    Ok(())
+}
+
+fn strict_anthropic_document_source(source: Option<&Map<String, Value>>) -> Result<()> {
+    let source =
+        source.ok_or_else(|| anyhow::anyhow!("Anthropic document source must be an object"))?;
+    match source.get("type").and_then(Value::as_str) {
+        Some("url") => {
+            source
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|url| !url.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Anthropic document source.url must be a non-empty string")
+                })?;
+        }
+        Some("base64") => {
+            source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .filter(|media_type| !media_type.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Anthropic document source.media_type must be a non-empty string"
+                    )
+                })?;
+            source
+                .get("data")
+                .and_then(Value::as_str)
+                .filter(|data| !data.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Anthropic document source.data must be a non-empty string")
+                })?;
+        }
+        Some(other) => bail!("unsupported Anthropic document source type: {other}"),
+        None => bail!("Anthropic document source.type must be a string"),
+    }
+    Ok(())
 }
 
 pub(super) fn anthropic_document_to_responses_file(part: &Value) -> Value {
@@ -402,33 +951,14 @@ pub(super) fn responses_usage_from_anthropic(usage: Option<&Value>) -> Value {
     json!({ "input_tokens": input, "output_tokens": output, "total_tokens": input + output })
 }
 
-pub(super) fn chat_message_content_to_anthropic(msg: &Map<String, Value>) -> Value {
+pub(super) fn chat_message_content_to_anthropic(msg: &Map<String, Value>) -> Result<Value> {
     let mut content = match msg.get("content") {
         Some(Value::String(text)) => json!([{ "type": "text", "text": text }]),
         Some(Value::Array(parts)) => Value::Array(
             parts
                 .iter()
-                .filter_map(|part| {
-                    let obj = part.as_object()?;
-                    match obj.get("type").and_then(Value::as_str).unwrap_or("") {
-                        "text" => obj
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .map(|text| json!({ "type": "text", "text": text })),
-                        "image_url" => obj
-                            .get("image_url")
-                            .and_then(|v| v.get("url"))
-                            .and_then(Value::as_str)
-                            .map(|url| {
-                                json!({
-                                    "type": "image",
-                                    "source": image_url_to_anthropic_source(url)
-                                })
-                            }),
-                        _ => None,
-                    }
-                })
-                .collect(),
+                .map(chat_part_to_anthropic_content)
+                .collect::<Result<Vec<_>>>()?,
         ),
         _ => json!([]),
     };
@@ -445,7 +975,33 @@ pub(super) fn chat_message_content_to_anthropic(msg: &Map<String, Value>) -> Val
         }
         content = Value::Array(parts);
     }
-    content
+    Ok(content)
+}
+
+fn chat_part_to_anthropic_content(part: &Value) -> Result<Value> {
+    let obj = part
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Chat content part must be an object"))?;
+    match obj.get("type").and_then(Value::as_str).unwrap_or("") {
+        "text" => Ok(json!({
+            "type": "text",
+            "text": obj.get("text").and_then(Value::as_str).unwrap_or("")
+        })),
+        "image_url" => {
+            let url = obj
+                .get("image_url")
+                .and_then(Value::as_object)
+                .and_then(|image| image.get("url"))
+                .and_then(Value::as_str)
+                .filter(|url| !url.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Chat image_url.url must be a non-empty string"))?;
+            Ok(json!({
+                "type": "image",
+                "source": image_url_to_anthropic_source(url)
+            }))
+        }
+        other => bail!("unsupported Chat content part type: {other}"),
+    }
 }
 
 pub(super) fn chat_tool_to_anthropic(tool: &Value) -> Option<Value> {
@@ -656,11 +1212,10 @@ pub(crate) fn normalize_tool_calls(calls: &[Value]) -> Vec<Value> {
                         .unwrap_or("unknown");
                     let a = normalize_arguments(func.get("arguments"));
                     (n, a)
-                } else if let Some(n) = obj.get("name").and_then(Value::as_str) {
+                } else {
+                    let n = obj.get("name").and_then(Value::as_str)?;
                     let a = normalize_arguments(obj.get("arguments"));
                     (n, a)
-                } else {
-                    return None;
                 };
 
             Some(json!({
@@ -691,28 +1246,8 @@ pub(super) fn extract_chat_content_text(value: Option<&Value>) -> String {
     extract_text_from_content(value)
 }
 
-pub(super) fn responses_usage(usage: Option<&Value>) -> Value {
-    let input = usage
-        .and_then(|u| u.get("prompt_tokens"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let output = usage
-        .and_then(|u| u.get("completion_tokens"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let total = usage
-        .and_then(|u| u.get("total_tokens"))
-        .and_then(Value::as_i64)
-        .unwrap_or(input + output);
-    json!({
-        "input_tokens": input,
-        "output_tokens": output,
-        "total_tokens": total
-    })
-}
-
 /// Adapt an outbound Responses body to the target native endpoint's compat
-/// declaration (design §5.1 Layer 0b egress review). Single source of truth for
+/// declaration. Single source of truth for
 /// upstream quirks; applied by every path that sends to a Responses native
 /// endpoint (conversion, passthrough, probe).
 pub(crate) fn apply_responses_egress_compat(
@@ -732,7 +1267,7 @@ pub(crate) fn apply_responses_egress_compat(
             json!([{"type": "message", "role": "user", "content": [{"type": "input_text", "text": input}]}]),
         );
     }
-    // store injection priority (research §3.1a):
+    // store injection priority:
     //   compat must_not_store > endpoint store > client passthrough > default false.
     if compat.effective_must_not_store() {
         obj.insert("store".to_string(), json!(false));

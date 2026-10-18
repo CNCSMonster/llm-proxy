@@ -4,26 +4,28 @@ use serde_json::{Value, json};
 
 use crate::config::{AuthConfig, ExecutionPlan, Protocol, ResolvedAuth};
 
+/// 探活请求的统一输出上限：须高于默认思考预算（1024）与常见上游最小输出
+/// 约束，避免思考类端点以「预算不低于上限 / 上限过小」为由拒绝探活，
+/// 把健康模型误报成故障；后续可按 provider 能力自适应收敛。
+const PROBE_MAX_OUTPUT_TOKENS: u32 = 16_384;
+
 #[cfg(test)]
 pub fn probe_body(plan: &ExecutionPlan) -> Result<Value> {
     probe_body_with_auth(plan, None)
 }
 
-pub fn probe_body_with_auth(plan: &ExecutionPlan, auth: Option<&ResolvedAuth>) -> Result<Value> {
+pub fn probe_body_with_auth(plan: &ExecutionPlan, _auth: Option<&ResolvedAuth>) -> Result<Value> {
     match plan.source_protocol {
         Protocol::OpenaiChatCompletions => {
-            // Use the provider's configured max_tokens field name (e.g., "max_completion_tokens" for MiMo)
-            let max_tokens_key = plan
-                .compat
-                .max_tokens_field
-                .as_deref()
-                .unwrap_or("max_tokens");
+            // Use the provider's configured max_tokens field name
+            // (default: "max_completion_tokens"; legacy models override via compat.max_tokens_field)
+            let max_tokens_key = plan.compat.effective_max_tokens_field();
             let mut body = json!({
                 "model": plan.upstream_model,
                 "messages": [{"role": "user", "content": "Reply with exactly: pong"}],
                 "stream": false
             });
-            body[max_tokens_key] = json!(16);
+            body[max_tokens_key] = json!(PROBE_MAX_OUTPUT_TOKENS);
             Ok(body)
         }
         Protocol::OpenaiResponses => {
@@ -34,10 +36,10 @@ pub fn probe_body_with_auth(plan: &ExecutionPlan, auth: Option<&ResolvedAuth>) -
                     "role": "user",
                     "content": [{"type": "input_text", "text": "Reply with exactly: pong"}]
                 }],
-                "max_output_tokens": 16,
+                "max_output_tokens": PROBE_MAX_OUTPUT_TOKENS,
                 "stream": false
             });
-            // Reuse the runtime egress adaptation (design §5.1 / ADR-017) so the
+            // Reuse the runtime egress adaptation (ADR-017) so the
             // probe body matches what the proxy actually sends upstream.
             crate::convert::apply_responses_egress_compat(&mut body, &plan.compat, plan.store);
 
@@ -67,46 +69,26 @@ pub fn probe_body_with_auth(plan: &ExecutionPlan, auth: Option<&ResolvedAuth>) -
         Protocol::Anthropic => Ok(json!({
             "model": plan.upstream_model,
             "messages": [{"role": "user", "content": "Reply with exactly: pong"}],
-            "max_tokens": 16,
+            "max_tokens": PROBE_MAX_OUTPUT_TOKENS,
             "stream": false
         })),
-        Protocol::Antigravity => {
-            let project_id = auth
-                .and_then(|auth| auth.project_id.as_deref())
-                .filter(|project_id| !project_id.is_empty())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "connectivity probe for Antigravity requires OAuth project_id; run `llm-proxy provider login {}`",
-                        plan.provider_id
-                    )
-                })?;
-            Ok(json!({
-                "project": project_id,
-                "model": plan.upstream_model,
-                "request": {
-                    "contents": [{
-                        "role": "user",
-                        "parts": [{"text": "Reply with exactly: pong"}]
-                    }],
-                    "generationConfig": {
-                        "maxOutputTokens": 16
-                    }
-                }
-            }))
-        }
     }
 }
 
+pub const ANTHROPIC_USER_AGENT: &str = "anthropic-typescript/0.39.0";
+pub const OPENAI_USER_AGENT: &str = "OpenAI/Python 1.65.0";
+
 pub fn apply_protocol_headers(plan: &ExecutionPlan, request: RequestBuilder) -> RequestBuilder {
-    // 设置中性 User-Agent 以避免触发 Coding Plan 等端点的 agent 检测
-    // (如百炼 Coding Plan 返回 405 "only available for Coding Agents" 当使用 reqwest 默认 UA)
-    let request = match plan.source_protocol {
-        Protocol::Antigravity => request.header("User-Agent", "antigravity/hub/2.2.1 darwin/arm64"),
-        _ => request.header("User-Agent", "llm-proxy/0.2.0 (connectivity-probe)"),
-    };
+    // ADR-017: 统一遵循各协议官方客户端真实标准 UA，
+    // 严禁使用自曝代理或探测器身份的 User-Agent（如 llm-proxy 或 connectivity-probe），
+    // 避免触发风控或百炼 Coding Plan 等端点的 agent 检测（如 405 "only available for Coding Agents"）。
     match plan.source_protocol {
-        Protocol::Anthropic => request.header("anthropic-version", "2023-06-01"),
-        _ => request,
+        Protocol::Anthropic => request
+            .header("User-Agent", ANTHROPIC_USER_AGENT)
+            .header("anthropic-version", "2023-06-01"),
+        Protocol::OpenaiChatCompletions | Protocol::OpenaiResponses => {
+            request.header("User-Agent", OPENAI_USER_AGENT)
+        }
     }
 }
 
@@ -155,6 +137,7 @@ mod tests {
             anthropic_family_models: Vec::new(),
             store: None,
             request_frequency: RequestFrequencyConfig::default(),
+            routed_target: None,
         }
     }
 
@@ -167,10 +150,11 @@ mod tests {
 
     #[test]
     fn probe_body_uses_protocol_specific_token_field() {
+        // default max_tokens_field is now "max_completion_tokens"
         assert!(
             probe_body(&plan(Protocol::OpenaiChatCompletions))
                 .unwrap()
-                .get("max_tokens")
+                .get("max_completion_tokens")
                 .is_some()
         );
         let responses_body = probe_body(&plan(Protocol::OpenaiResponses)).unwrap();
@@ -194,14 +178,38 @@ mod tests {
                 .get("max_tokens")
                 .is_some()
         );
-        assert!(probe_body(&plan(Protocol::Antigravity)).is_err());
-        let auth = ResolvedAuth {
-            token: Some("token".to_string()),
-            project_id: Some("project".to_string()),
-        };
-        let body = probe_body_with_auth(&plan(Protocol::Antigravity), Some(&auth)).unwrap();
-        assert_eq!(body["project"], "project");
-        assert_eq!(body["request"]["generationConfig"]["maxOutputTokens"], 16);
+    }
+
+    #[test]
+    fn probe_max_tokens_stay_above_default_thinking_budget() {
+        // 探活输出上限必须高于默认思考预算（1024）与常见上游最小输出约束，
+        // 否则思考类端点会以「预算不低于上限 / 上限过小」为由拒绝探活请求，
+        // 把健康模型误报成故障并可能触发上游 400 配额累计。
+        const MIN_PROBE_CAP: u64 = 16_384;
+
+        let chat = probe_body(&plan(Protocol::OpenaiChatCompletions)).unwrap();
+        let cap = chat
+            .get("max_completion_tokens")
+            .or_else(|| chat.get("max_tokens"))
+            .and_then(Value::as_u64);
+        assert!(
+            cap.is_some_and(|c| c >= MIN_PROBE_CAP),
+            "chat probe cap must be >= {MIN_PROBE_CAP}, got {cap:?}"
+        );
+
+        let responses = probe_body(&plan(Protocol::OpenaiResponses)).unwrap();
+        let cap = responses.get("max_output_tokens").and_then(Value::as_u64);
+        assert!(
+            cap.is_some_and(|c| c >= MIN_PROBE_CAP),
+            "responses probe cap must be >= {MIN_PROBE_CAP}, got {cap:?}"
+        );
+
+        let anthropic = probe_body(&plan(Protocol::Anthropic)).unwrap();
+        let cap = anthropic.get("max_tokens").and_then(Value::as_u64);
+        assert!(
+            cap.is_some_and(|c| c >= MIN_PROBE_CAP),
+            "anthropic probe cap must be >= {MIN_PROBE_CAP}, got {cap:?}"
+        );
     }
 
     #[test]
@@ -216,6 +224,25 @@ mod tests {
         assert_eq!(body.get("stream").and_then(Value::as_bool), Some(true));
         assert_eq!(body.get("store").and_then(Value::as_bool), Some(false));
         assert!(body.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn chat_probe_uses_legacy_max_tokens_when_explicitly_configured() {
+        // backward compat — explicit "max_tokens" override still works
+        let mut p = plan(Protocol::OpenaiChatCompletions);
+        p.compat = CompatConfig {
+            max_tokens_field: Some("max_tokens".to_string()),
+            ..CompatConfig::default()
+        };
+        let body = probe_body(&p).unwrap();
+        assert!(
+            body.get("max_tokens").is_some(),
+            "legacy max_tokens_field override must produce max_tokens key"
+        );
+        assert!(
+            body.get("max_completion_tokens").is_none(),
+            "must not emit both keys"
+        );
     }
 
     #[test]
@@ -245,5 +272,54 @@ mod tests {
             )),
             AuthHeaderStyle::Bearer
         );
+    }
+
+    #[test]
+    fn protocol_headers_use_official_clients_and_never_expose_probe() {
+        let client = reqwest::Client::new();
+        let protocols = [
+            Protocol::Anthropic,
+            Protocol::OpenaiChatCompletions,
+            Protocol::OpenaiResponses,
+        ];
+
+        for proto in protocols {
+            let p = plan(proto);
+            let req = apply_protocol_headers(&p, client.post("http://127.0.0.1/test"))
+                .build()
+                .expect("build request");
+            let ua = req
+                .headers()
+                .get(reqwest::header::USER_AGENT)
+                .expect("User-Agent header must be present")
+                .to_str()
+                .expect("valid utf-8 User-Agent");
+
+            // ADR-017: 绝不能出现自曝特征
+            assert!(
+                !ua.contains("llm-proxy"),
+                "User-Agent for {proto:?} must never expose 'llm-proxy', got: {ua}"
+            );
+            assert!(
+                !ua.contains("connectivity-probe"),
+                "User-Agent for {proto:?} must never expose 'connectivity-probe', got: {ua}"
+            );
+
+            match proto {
+                Protocol::Anthropic => {
+                    assert_eq!(ua, ANTHROPIC_USER_AGENT);
+                    let anthropic_ver = req
+                        .headers()
+                        .get("anthropic-version")
+                        .expect("anthropic-version header must be present")
+                        .to_str()
+                        .unwrap();
+                    assert_eq!(anthropic_ver, "2023-06-01");
+                }
+                Protocol::OpenaiChatCompletions | Protocol::OpenaiResponses => {
+                    assert_eq!(ua, OPENAI_USER_AGENT);
+                }
+            }
+        }
     }
 }

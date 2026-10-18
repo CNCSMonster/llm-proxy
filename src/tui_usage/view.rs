@@ -90,6 +90,17 @@ fn render_header(f: &mut Frame, state: &UsageTuiState, area: Rect) {
 }
 
 fn render_summary(f: &mut Frame, state: &UsageTuiState, area: Rect) {
+    // 加载失败时明确展示错误，避免"数据没读出来"与"确实没有用量"无法区分
+    if let Some(ref err) = state.load_error {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("⚠ {err}"),
+                Style::default().fg(Color::Red),
+            ))),
+            area,
+        );
+        return;
+    }
     let summary = Line::from(vec![
         Span::raw("Total: "),
         Span::styled(
@@ -166,7 +177,13 @@ fn render_table(f: &mut Frame, state: &UsageTuiState, area: Rect) {
             .title(state.view_mode.as_str()),
     );
 
-    f.render_widget(table, area);
+    // TableState::select 会让 ratatui 自动滚动窗口保持选中行可见，
+    // 避免行数超过表格高度后光标移出视口（usage 数据跨多月时可达数百行）。
+    let mut table_state = ratatui::widgets::TableState::default();
+    if !state.rows.is_empty() {
+        table_state.select(Some(state.cursor.min(state.rows.len() - 1)));
+    }
+    f.render_stateful_widget(table, area, &mut table_state);
 }
 
 fn render_help(f: &mut Frame, area: Rect) {
@@ -210,7 +227,11 @@ fn render_detail(f: &mut Frame, state: &UsageTuiState, area: Rect) {
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     )));
-    for r in state.detail_records.iter().take(MAX_DETAIL_ROWS) {
+    // 按可用高度截断，始终给"… and N more"指示行留位置，避免矮终端下指示本身被裁掉
+    let available = (area.height as usize).saturating_sub(2); // 内边框
+    let reserve = usize::from(state.detail_records.len() > MAX_DETAIL_ROWS);
+    let shown = MAX_DETAIL_ROWS.min(available.saturating_sub(reserve).saturating_sub(1));
+    for r in state.detail_records.iter().take(shown) {
         let time = r
             .parsed_timestamp()
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -228,12 +249,9 @@ fn render_detail(f: &mut Frame, state: &UsageTuiState, area: Rect) {
             format_number(r.output_tokens),
         )));
     }
-    if state.detail_records.len() > MAX_DETAIL_ROWS {
+    if state.detail_records.len() > shown {
         lines.push(Line::from(Span::styled(
-            format!(
-                "… and {} more",
-                state.detail_records.len() - MAX_DETAIL_ROWS
-            ),
+            format!("… and {} more", state.detail_records.len() - shown),
             Style::default().fg(Color::DarkGray),
         )));
     }

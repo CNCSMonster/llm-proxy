@@ -171,8 +171,9 @@ pub(crate) fn handle_editor_input(app: &mut AppModel, key: KeyEvent) {
                                     // 根据模式返回不同的屏幕
                                     match &state.purpose {
                                         model::EditorPurpose::Create => {
-                                            app.screen =
-                                                Screen::ProductSelection(make_product_state());
+                                            app.screen = Screen::ProductSelection(
+                                                make_product_state(&app.config_path),
+                                            );
                                         }
                                         model::EditorPurpose::Edit { original_name, .. } => {
                                             let name = original_name.clone();
@@ -192,7 +193,8 @@ pub(crate) fn handle_editor_input(app: &mut AppModel, key: KeyEvent) {
                     // Esc = Cancel (根据模式返回不同屏幕)
                     match &state.purpose {
                         model::EditorPurpose::Create => {
-                            app.screen = Screen::ProductSelection(make_product_state());
+                            app.screen =
+                                Screen::ProductSelection(make_product_state(&app.config_path));
                         }
                         model::EditorPurpose::Edit { original_name, .. } => {
                             let name = original_name.clone();
@@ -271,7 +273,10 @@ fn execute_save_from_values(
         product_name: app.custom_provider_name.clone().unwrap_or_default(),
         env_var: app.chosen_env_var.clone(),
         models: Vec::new(),
-        force_local: false,
+        skip_probe: false,
+        progress_done: 0,
+        progress_total: 0,
+        progress_current_model: None,
     });
 }
 
@@ -285,11 +290,17 @@ fn execute_edit_save(
     openai_responses_url: Option<String>,
     anthropic_url: Option<String>,
 ) {
-    use crate::config::Config;
-
-    // 加载配置
-    let mut config = match Config::load(&app.config_path) {
-        Ok(cfg) => cfg,
+    // 加载配置（正文与代际同一次读取，供整体替换的 CAS 依据）
+    let config_path_for_load = app.config_path.clone();
+    let config_dir_for_load = config_path_for_load
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let runtime_dir_for_load = crate::service::StateDirs::resolve(config_dir_for_load).runtime_dir;
+    let (mut config, base) = match crate::tui::run_async_sync(async move {
+        crate::admin_client::load_config_for_replace(&config_path_for_load, &runtime_dir_for_load)
+            .await
+    }) {
+        Ok(result) => result,
         Err(e) => {
             if let Screen::CustomProviderEditor(ref mut state) = app.screen {
                 state.error = Some(format!("Failed to load config: {}", e));
@@ -383,8 +394,10 @@ fn execute_edit_save(
                 let config_path = config_path.clone();
                 let config = config.clone();
                 async move {
+                    let config_dir = config_path.parent().unwrap_or(std::path::Path::new("."));
+                    let runtime_dir = crate::service::StateDirs::resolve(config_dir).runtime_dir;
                     let _lock = crate::core::ConfigLock::acquire(
-                        &crate::service::state_dir(),
+                        &runtime_dir,
                         std::time::Duration::from_secs(5),
                     )?;
                     crate::config_edit::write_full_config(&config_path, &config)
@@ -393,7 +406,7 @@ fn execute_edit_save(
             // Delegate: server running, send via UDS
             |server| {
                 let config = config.clone();
-                Box::pin(async move { server.config_update(&config).await.map(|_| ()) })
+                Box::pin(async move { server.config_update(&config, base).await.map(|_| ()) })
             },
         )
         .await

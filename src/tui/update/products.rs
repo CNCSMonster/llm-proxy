@@ -38,33 +38,14 @@ pub(crate) fn select_product_after_naming(
 fn select_product_inner(app: &mut AppModel, item: super::model::ProductItem, product_name: String) {
     // OAuth provider：直接进入对应的 OAuth 登录屏幕
     match &item.auth_type {
-        ProviderAuthType::OpenaiOauth | ProviderAuthType::AntigravityOauth => {
+        ProviderAuthType::OpenaiOauth => {
             app.chosen_product = Some(item.clone());
             let provider_name = app
                 .oauth_provider_name
                 .clone()
                 .unwrap_or_else(|| item.id.clone());
-            match &item.auth_type {
-                ProviderAuthType::OpenaiOauth => {
-                    app.screen = Screen::OAuthDeviceCode(model::OAuthDeviceCodeState {
-                        provider_name,
-                        device_code: String::new(),
-                        verification_url: String::new(),
-                        expires_at: std::time::Instant::now()
-                            + std::time::Duration::from_secs(15 * 60),
-                        copied: false,
-                        polling: false,
-                        retry_count: 0,
-                        last_error: None,
-                        error: None,
-                    });
-                }
-                ProviderAuthType::AntigravityOauth => {
-                    app.screen =
-                        Screen::AntigravityLogin(model::AntigravityLoginState::new(provider_name));
-                }
-                _ => unreachable!(),
-            }
+            app.screen =
+                Screen::OAuthDeviceCode(model::OAuthDeviceCodeState::pending_login(provider_name));
             return;
         }
         // No auth required (e.g. Ollama): skip env var selection, go directly to model selection
@@ -79,7 +60,10 @@ fn select_product_inner(app: &mut AppModel, item: super::model::ProductItem, pro
                     product_name,
                     env_var: None,
                     models: vec![],
-                    force_local: false,
+                    skip_probe: false,
+                    progress_done: 0,
+                    progress_total: 0,
+                    progress_current_model: None,
                 });
             } else {
                 let configured = if let Some(ref product) = app.chosen_product {
@@ -96,6 +80,10 @@ fn select_product_inner(app: &mut AppModel, item: super::model::ProductItem, pro
                     configured,
                     error: None,
                     product_name,
+                    source: model::ModelSelectionSource::Connect,
+                    is_openrouter: false,
+                    is_degraded: false,
+                    openrouter_cached_at: None,
                 });
             }
             return;
@@ -108,9 +96,9 @@ fn select_product_inner(app: &mut AppModel, item: super::model::ProductItem, pro
     let env_state = super::env::make_env_state(app);
     app.screen = Screen::EnvVarSelection(env_state);
 }
-pub(crate) fn make_product_state() -> model::ProductSelectionState {
+pub(crate) fn make_product_state(config_path: &std::path::Path) -> model::ProductSelectionState {
     model::ProductSelectionState {
-        items: model::build_product_list(),
+        items: model::build_product_list(config_path),
         cursor: 0,
         filter: String::new(),
         filter_active: false,
@@ -130,6 +118,7 @@ pub(crate) fn handle_product_keys(app: &mut AppModel, key: KeyEvent) {
             match key.code {
                 KeyCode::Esc => {
                     if let Screen::ProductSelection(ref mut s) = app.screen {
+                        s.error = None;
                         s.deactivate_filter();
                     }
                     return;
@@ -148,8 +137,13 @@ pub(crate) fn handle_product_keys(app: &mut AppModel, key: KeyEvent) {
                             return;
                         }
                     };
-                    if let Some(item) = item {
-                        select_product(app, item.clone(), product_name);
+                    match item {
+                        Some(item) => select_product(app, item.clone(), product_name),
+                        None => {
+                            if let Screen::ProductSelection(ref mut s) = app.screen {
+                                s.error = Some(format!("no product matches {:?}", s.filter));
+                            }
+                        }
                     }
                     return;
                 }
@@ -183,6 +177,7 @@ pub(crate) fn handle_product_keys(app: &mut AppModel, key: KeyEvent) {
                 }
                 _ => {
                     if let Screen::ProductSelection(ref mut s) = app.screen {
+                        s.error = None;
                         handle_filter_input(&mut s.filter, key);
                     }
                     return;
@@ -226,5 +221,70 @@ pub(crate) fn handle_product_keys(app: &mut AppModel, key: KeyEvent) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::model::EntryMode;
+
+    #[test]
+    fn product_selection_filter_no_match_enter_shows_error_feedback() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut app = AppModel::new(temp.path().join("config.toml"), EntryMode::Connect);
+        if let Screen::ProductSelection(ref mut s) = app.screen {
+            s.activate_filter();
+            s.filter = "openrotuer".to_string();
+        } else {
+            panic!("expected ProductSelection screen");
+        }
+
+        handle_product_keys(&mut app, KeyEvent::from(KeyCode::Enter));
+
+        match app.screen {
+            Screen::ProductSelection(ref s) => {
+                assert_eq!(
+                    s.error.as_deref(),
+                    Some("no product matches \"openrotuer\"")
+                );
+            }
+            _ => panic!("must remain on ProductSelection screen"),
+        }
+    }
+
+    #[test]
+    fn product_selection_filter_match_enter_advances_screen() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut app = AppModel::new(temp.path().join("config.toml"), EntryMode::Connect);
+        if let Screen::ProductSelection(ref mut s) = app.screen {
+            s.activate_filter();
+            s.filter = "DeepSeek".to_string();
+        } else {
+            panic!("expected ProductSelection screen");
+        }
+
+        handle_product_keys(&mut app, KeyEvent::from(KeyCode::Enter));
+
+        assert!(!matches!(app.screen, Screen::ProductSelection(_)));
+    }
+
+    #[test]
+    fn product_selection_filter_error_cleared_on_input_or_esc() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut app = AppModel::new(temp.path().join("config.toml"), EntryMode::Connect);
+        if let Screen::ProductSelection(ref mut s) = app.screen {
+            s.activate_filter();
+            s.filter = "openrotuer".to_string();
+        }
+        handle_product_keys(&mut app, KeyEvent::from(KeyCode::Enter));
+        if let Screen::ProductSelection(ref s) = app.screen {
+            assert!(s.error.is_some());
+        }
+
+        handle_product_keys(&mut app, KeyEvent::from(KeyCode::Backspace));
+        if let Screen::ProductSelection(ref s) = app.screen {
+            assert_eq!(s.error, None);
+        }
     }
 }

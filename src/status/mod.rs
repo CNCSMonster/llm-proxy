@@ -1,22 +1,25 @@
 mod cache;
 mod display;
 mod format;
-mod probe;
+pub(crate) mod probe;
+pub mod selection;
 #[cfg(test)]
 mod tests;
-
 // Re-export public API
 // DynamicModelCacheEntry is used by model.rs tests via crate::status::DynamicModelCacheEntry
 #[allow(unused_imports)]
 pub use cache::{
-    DynamicModelCacheEntry, ProbeCacheEntry, ProbeResult, StatusCache, cache_path, read_cache,
-    write_cache,
+    DynamicModelCacheEntry, ProbeCacheEntry, ProbeResult, StatusCache, cache_path, cache_path_in,
+    read_cache, write_cache,
 };
-pub(crate) use display::print_providers;
 pub(crate) use display::provider_auth_summary;
+pub(crate) use display::{AuthScope, print_providers};
 pub use display::{print_provider_info, print_provider_info_json};
-pub use probe::print_status;
+pub(crate) use probe::discover_dynamic_models;
 pub(crate) use probe::run_one_online_probe;
+#[allow(unused_imports)]
+pub use probe::{print_status, print_status_with_cache_path};
+pub use selection::ProbeSelection;
 
 // Re-export format helpers used by other modules and tests
 pub use format::probe_key;

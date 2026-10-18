@@ -1,6 +1,21 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
-use super::model::{AppModel, FallbackFocus, FallbackSource, Screen};
+use super::model::{AppModel, FallbackConfigState, FallbackFocus, FallbackSource, Screen};
+
+/// Fallback 主内容区的可视行数：终端高度扣除外边框(2)、帮助栏(1)、标题(2)、副标题(1)、区头(1)、底栏(1)。
+fn fallback_viewport(app_height: u16) -> usize {
+    app_height.saturating_sub(8) as usize
+}
+
+/// 按键移动 / Tab 切换焦点 / 终端缩放后，重对齐主内容区滚动窗口。
+fn sync_fallback_scroll(state: &mut FallbackConfigState, app_height: u16) {
+    let cursor_line = state.active_cursor_line();
+    super::model::follow_scroll(
+        &mut state.scroll_offset,
+        cursor_line,
+        fallback_viewport(app_height),
+    );
+}
 
 /// Handle keyboard input on the FallbackConfig screen.
 pub(crate) fn handle_fallback_keys(app: &mut AppModel, key: KeyEvent) {
@@ -12,6 +27,7 @@ pub(crate) fn handle_fallback_keys(app: &mut AppModel, key: KeyEvent) {
                     FallbackFocus::TargetProvider => FallbackFocus::Options,
                     FallbackFocus::Options => FallbackFocus::TargetProvider,
                 };
+                sync_fallback_scroll(s, app.height);
             }
         }
 
@@ -39,11 +55,13 @@ pub(crate) fn handle_fallback_keys(app: &mut AppModel, key: KeyEvent) {
         KeyCode::Up | KeyCode::Char('k') => {
             if let Screen::FallbackConfig(ref mut s) = app.screen {
                 s.move_up();
+                sync_fallback_scroll(s, app.height);
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if let Screen::FallbackConfig(ref mut s) = app.screen {
                 s.move_down();
+                sync_fallback_scroll(s, app.height);
             }
         }
 
@@ -80,12 +98,15 @@ fn confirm_fallback_config(app: &mut AppModel) {
                     product_name,
                     env_var,
                     models: vec![],
-                    force_local: false,
+                    skip_probe: false,
+                    progress_done: 0,
+                    progress_total: 0,
+                    progress_current_model: None,
                 });
                 return;
             }
 
-            // Proceed to Verifying with selected models
+            // Proceed to Verifying with selected model IDs and endpoint filter
             let product_name = app
                 .chosen_product
                 .as_ref()
@@ -93,11 +114,62 @@ fn confirm_fallback_config(app: &mut AppModel) {
                 .unwrap_or_default();
             let env_var = app.chosen_env_var.clone();
 
+            let selected_options: Vec<(&str, &str)> =
+                if let Screen::FallbackConfig(ref s) = app.screen {
+                    s.options
+                        .iter()
+                        .filter(|opt| opt.selected)
+                        .map(|opt| (opt.model_id.as_str(), opt.endpoint.as_str()))
+                        .collect()
+                } else {
+                    vec![]
+                };
+
+            // Build endpoint filter: model_id → set of protocol labels
+            let mut filter_map: std::collections::HashMap<
+                String,
+                std::collections::HashSet<String>,
+            > = std::collections::HashMap::new();
+            let mut model_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (model_id, endpoint) in &selected_options {
+                filter_map
+                    .entry(model_id.to_string())
+                    .or_default()
+                    .insert(endpoint.to_string());
+                model_ids.insert(model_id.to_string());
+            }
+            let selected_models: Vec<String> = model_ids.into_iter().collect();
+            app.endpoint_filter = if filter_map.is_empty() {
+                None
+            } else {
+                Some(filter_map)
+            };
+            app.chosen_models = selected_models.clone();
+
+            // Store fallback target and binding specs for post-creation chain insertion
+            let (fallback_target, fallback_bindings) =
+                if let Screen::FallbackConfig(ref s) = app.screen {
+                    let target = s.selected_target().map(|t| t.to_string());
+                    let specs: Vec<String> = s
+                        .selected_options()
+                        .iter()
+                        .map(|opt| format!("{}:{}", opt.model_id, opt.endpoint))
+                        .collect();
+                    (target, specs)
+                } else {
+                    (None, vec![])
+                };
+            app.fallback_target = fallback_target;
+            app.fallback_bindings = fallback_bindings;
+
             app.screen = Screen::Verifying(super::model::VerifyingState {
                 product_name,
                 env_var,
-                models: vec![],
-                force_local: false,
+                models: selected_models,
+                skip_probe: false,
+                progress_done: 0,
+                progress_total: 0,
+                progress_current_model: None,
             });
         }
         FallbackSource::ProviderManagement { ref provider_name } => {
@@ -300,5 +372,9 @@ fn switch_to_model_selection(app: &mut AppModel) {
         configured,
         error: None,
         product_name,
+        source: super::model::ModelSelectionSource::Connect,
+        is_openrouter: false,
+        is_degraded: false,
+        openrouter_cached_at: None,
     });
 }

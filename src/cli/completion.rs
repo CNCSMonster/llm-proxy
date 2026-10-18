@@ -13,7 +13,7 @@ use clap::CommandFactory;
 use super::types::{Cli, CompleteCandidatesKind, CompletionShell};
 
 /// Bash: wrapper function that intercepts `--provider` / `--model` and
-/// delegates everything else to the static completion function `_llm-proxy`
+/// delegates everything else to the static completion function `_llm__proxy`
 /// (name emitted by clap_complete for the `llm-proxy` binary).
 ///
 /// 额外兜底：clap_complete 对含连字符的二进制名（llm-proxy）生成的 bash
@@ -47,7 +47,7 @@ _llm-proxy-dynamic() {
         COMPREPLY=($(compgen -W "-p -h --period --provider --model --endpoint --view --json --help" -- "${cur}"))
         return 0
     fi
-    _llm-proxy "$@"
+    _llm__proxy "$@"
 }
 if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
     complete -F _llm-proxy-dynamic -o nosort -o bashdefault -o default llm-proxy
@@ -101,7 +101,7 @@ pub fn generate_completion_script(shell: CompletionShell) -> String {
 /// Collect completion candidates of a kind, preferring a running server.
 ///
 /// Remote-first: if `detect_server` finds a compatible server (local or
-/// container→host), delegate via HTTP public endpoints (`/admin/provider/list`
+/// container→host), delegate via UDS management channel (`/admin/provider/list`
 /// and `/admin/model/list`). Otherwise fall back to reading the local
 /// config.toml.
 ///
@@ -111,9 +111,26 @@ pub fn generate_completion_script(shell: CompletionShell) -> String {
 /// error is still reported on stderr (discarded by the shell snippets via
 /// `2>/dev/null`).
 pub async fn complete_candidates(config_path: &Path, kind: CompleteCandidatesKind) -> String {
-    // 远程优先：有 server 时走 HTTP 公开接口委托
+    let config_dir = config_path.parent().unwrap_or(std::path::Path::new("."));
+    let dirs = crate::service::StateDirs::resolve(config_dir);
+    complete_candidates_at(config_path, kind, &dirs.runtime_dir).await
+}
+
+/// Internal variant: accepts an explicit `runtime_dir` so tests can point
+/// `detect_server_at` at a mock UDS server.
+async fn complete_candidates_at(
+    config_path: &Path,
+    kind: CompleteCandidatesKind,
+    runtime_dir: &Path,
+) -> String {
+    // 远程优先：有 server 时走 UDS 管理通道委托
     // Ok(None): server 未运行；Err: 版本不兼容。补全场景静默回退本地 config。
-    if let Ok(Some(server)) = crate::admin_client::detect_server(config_path).await {
+    if let Ok(Some(server)) = crate::admin_client::detect_server_at(config_path, runtime_dir).await
+    {
+        if let Err(e) = crate::ownership::ensure_same_config(&server, config_path) {
+            eprintln!("{e:#}");
+            return String::new();
+        }
         let candidates: Vec<String> = match kind {
             CompleteCandidatesKind::Provider => match server.list_providers().await {
                 Ok(ids) => ids,
@@ -222,12 +239,22 @@ anthropic_providers = [
         path
     }
 
-    /// Spawn a mock admin server with the standard completion endpoints.
-    /// Returns the bound address; the server runs on a background task.
+    /// Spawn a mock admin server over UDS with the standard completion endpoints.
+    /// Returns the temp dir (caller must keep alive) and the socket path.
+    #[cfg(unix)]
     async fn spawn_completion_mock_server(
         providers: Vec<&str>,
         models: Vec<&str>,
-    ) -> std::net::SocketAddr {
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        spawn_completion_mock_server_with_identity(providers, models, None).await
+    }
+
+    #[cfg(unix)]
+    async fn spawn_completion_mock_server_with_identity(
+        providers: Vec<&str>,
+        models: Vec<&str>,
+        config_identity: Option<String>,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
         let provider_body = serde_json::json!({
             "status": "ok",
             "data": { "providers": providers },
@@ -241,7 +268,16 @@ anthropic_providers = [
                     .collect::<Vec<_>>(),
             },
         });
-        let ping_body = serde_json::json!({ "status": "ok", "version": "0.2.5" });
+        let mut ping_map = serde_json::Map::new();
+        ping_map.insert("status".to_string(), serde_json::json!("ok"));
+        ping_map.insert(
+            "version".to_string(),
+            serde_json::json!(env!("CARGO_PKG_VERSION")),
+        );
+        if let Some(id) = config_identity {
+            ping_map.insert("config_identity".to_string(), serde_json::json!(id));
+        }
+        let ping_body = serde_json::Value::Object(ping_map);
         let app = axum::Router::new()
             .route(
                 "/admin/ping",
@@ -273,27 +309,47 @@ anthropic_providers = [
                     }
                 }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind mock admin server");
-        let addr = listener.local_addr().expect("mock addr");
+        // Serve over UDS at the canonical llm-proxy.sock path
+        use tokio::net::UnixListener;
+        let temp = tempfile::Builder::new()
+            .prefix("llm-proxy-completion-mock-")
+            // 跟随 TMPDIR（而非硬编码 /tmp）：与 runtime_temp 同设备，
+            // 避免 TMPDIR 重定向时 rename 跨设备 EXDEV
+            .tempdir_in(std::env::temp_dir())
+            .expect("tempdir");
+        let sock = temp.path().join("llm-proxy.sock");
+        let listener = UnixListener::bind(&sock).expect("bind uds mock");
         tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve mock admin");
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let service = hyper_util::service::TowerToHyperService::new(
+                    app.clone().into_service::<hyper::body::Incoming>(),
+                );
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service)
+                        .await;
+                });
+            }
         });
-        addr
+        (temp, sock)
     }
 
     #[tokio::test]
     async fn complete_candidates_lists_providers_and_models() {
-        // listen = 127.0.0.1:1 (不可达) → detect_server 返回 Ok(None) → 回退本地 config
+        // 注入空的 runtime_dir → detect_server_at 返回 Ok(None) → 回退本地 config
         let dir = tempfile::tempdir().expect("tempdir");
         let path = write_config(&dir, MINIMAL_CONFIG);
         assert_eq!(
-            complete_candidates(&path, CompleteCandidatesKind::Provider).await,
+            complete_candidates_at(&path, CompleteCandidatesKind::Provider, dir.path()).await,
             "alpha\nbeta\n"
         );
         assert_eq!(
-            complete_candidates(&path, CompleteCandidatesKind::Model).await,
+            complete_candidates_at(&path, CompleteCandidatesKind::Model, dir.path()).await,
             "model-a\nmodel-b\n"
         );
     }
@@ -303,39 +359,118 @@ anthropic_providers = [
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("does-not-exist.toml");
         assert_eq!(
-            complete_candidates(&path, CompleteCandidatesKind::Provider).await,
+            complete_candidates_at(&path, CompleteCandidatesKind::Provider, dir.path()).await,
             ""
         );
         assert_eq!(
-            complete_candidates(&path, CompleteCandidatesKind::Model).await,
+            complete_candidates_at(&path, CompleteCandidatesKind::Model, dir.path()).await,
             ""
         );
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn complete_candidates_prefers_remote_server_for_providers() {
         // 远程 server 返回 remote-p1/remote-p2，本地 config 有 alpha/beta
         // → 远程优先：应返回远程候选
-        let addr = spawn_completion_mock_server(vec!["remote-p1", "remote-p2"], vec![]).await;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_body = MINIMAL_CONFIG.replace("127.0.0.1:1", &addr.to_string());
-        let path = write_config(&dir, &config_body);
+        // 改为 UDS mock server + complete_candidates_at
+        let runtime_temp = tempfile::tempdir().expect("runtime dir");
+        let runtime_dir = runtime_temp.path();
+        let config_path = runtime_dir.join("config.toml");
+        std::fs::write(&config_path, MINIMAL_CONFIG).expect("write config");
+        let identity = crate::config::config_identity(runtime_dir);
+
+        let (_mock_dir, _sock) = spawn_completion_mock_server_with_identity(
+            vec!["remote-p1", "remote-p2"],
+            vec![],
+            Some(identity),
+        )
+        .await;
+        // Move mock socket into our runtime_dir so detect_server_at finds it
+        std::fs::rename(_sock, runtime_dir.join("llm-proxy.sock")).expect("move sock");
+
         assert_eq!(
-            complete_candidates(&path, CompleteCandidatesKind::Provider).await,
+            complete_candidates_at(&config_path, CompleteCandidatesKind::Provider, runtime_dir)
+                .await,
             "remote-p1\nremote-p2\n"
         );
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn complete_candidates_prefers_remote_server_for_models() {
-        let addr = spawn_completion_mock_server(vec![], vec!["remote-m1", "remote-m2"]).await;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_body = MINIMAL_CONFIG.replace("127.0.0.1:1", &addr.to_string());
-        let path = write_config(&dir, &config_body);
+        // 改为 UDS mock server + complete_candidates_at
+        let runtime_temp = tempfile::tempdir().expect("runtime dir");
+        let runtime_dir = runtime_temp.path();
+        let config_path = runtime_dir.join("config.toml");
+        std::fs::write(&config_path, MINIMAL_CONFIG).expect("write config");
+        let identity = crate::config::config_identity(runtime_dir);
+
+        let (_mock_dir, _sock) = spawn_completion_mock_server_with_identity(
+            vec![],
+            vec!["remote-m1", "remote-m2"],
+            Some(identity),
+        )
+        .await;
+        std::fs::rename(_sock, runtime_dir.join("llm-proxy.sock")).expect("move sock");
+
         assert_eq!(
-            complete_candidates(&path, CompleteCandidatesKind::Model).await,
+            complete_candidates_at(&config_path, CompleteCandidatesKind::Model, runtime_dir).await,
             "remote-m1\nremote-m2\n"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn complete_candidates_refuses_server_with_different_config_identity() {
+        let runtime_temp = tempfile::tempdir().expect("runtime dir");
+        let runtime_dir = runtime_temp.path();
+        let config_path = runtime_dir.join("config.toml");
+        std::fs::write(&config_path, MINIMAL_CONFIG).expect("write config");
+
+        // mock server 使用不同的 config_identity
+        let (_mock_dir, _sock) = spawn_completion_mock_server_with_identity(
+            vec!["remote-p1"],
+            vec!["remote-m1"],
+            Some("00000000deadbeef".to_string()),
+        )
+        .await;
+        std::fs::rename(_sock, runtime_dir.join("llm-proxy.sock")).expect("move sock");
+
+        // 读委托加门禁：不匹配时拒绝委托，且不做本地回退，返回空候选
+        let result =
+            complete_candidates_at(&config_path, CompleteCandidatesKind::Provider, runtime_dir)
+                .await;
+        assert_eq!(
+            result, "",
+            "must refuse delegation and not fall back to local config"
+        );
+
+        let result_model =
+            complete_candidates_at(&config_path, CompleteCandidatesKind::Model, runtime_dir).await;
+        assert_eq!(
+            result_model, "",
+            "must refuse delegation and not fall back to local config"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn complete_candidates_refuses_server_without_config_identity() {
+        let runtime_temp = tempfile::tempdir().expect("runtime dir");
+        let runtime_dir = runtime_temp.path();
+        let config_path = runtime_dir.join("config.toml");
+        std::fs::write(&config_path, MINIMAL_CONFIG).expect("write config");
+
+        // mock server 未上报 config_identity
+        let (_mock_dir, _sock) =
+            spawn_completion_mock_server(vec!["remote-p1"], vec!["remote-m1"]).await;
+        std::fs::rename(_sock, runtime_dir.join("llm-proxy.sock")).expect("move sock");
+
+        let result =
+            complete_candidates_at(&config_path, CompleteCandidatesKind::Provider, runtime_dir)
+                .await;
+        assert_eq!(result, "", "server without identity must be refused");
     }
 
     #[test]
@@ -346,7 +481,7 @@ anthropic_providers = [
         assert!(script.contains("_llm-proxy-dynamic"));
         assert!(script.contains("complete -F _llm-proxy-dynamic"));
         // 静态脚本仍在（委托目标存在）
-        assert!(script.contains("_llm-proxy()"));
+        assert!(script.contains("_llm__proxy()"));
     }
 
     #[test]

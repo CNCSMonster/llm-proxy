@@ -1,4 +1,4 @@
-#![allow(dead_code)] // Phase 1-2 groundwork for Admin API (Phase 3-4)
+#![allow(dead_code)] // groundwork for Admin API
 //! Core architecture layer — business logic separated from I/O.
 //!
 //! CoreState holds all application state (config, usage, oauth) and is the
@@ -20,40 +20,72 @@ pub struct CoreState {
     config: Config,
     usage_store: Option<Arc<UsageStore>>,
     config_path: PathBuf,
-    state_dir: PathBuf,
+    state_dirs: crate::service::StateDirs,
 }
 
 impl CoreState {
     /// Load core state from config file.
     pub fn load(config_path: &Path) -> Result<Self> {
         let config = Config::load(config_path)?;
-        let state_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let usage_store = UsageStore::new(config.server.usage.clone())
-            .ok()
+        let config_dir = config_path.parent().unwrap_or(Path::new("."));
+        let state_dirs = crate::service::StateDirs::resolve(config_dir);
+        // usage 必须与 state_dirs 同源：走全局默认会给默认 identity 凭空建目录。
+        let usage_store = config
+            .server
+            .as_ref()
+            .map(|s| s.usage.clone())
+            .and_then(|usage| UsageStore::new_with_state_dir(usage, &state_dirs.state_dir).ok())
             .map(Arc::new);
         Ok(Self {
             config,
             usage_store,
             config_path: config_path.to_path_buf(),
-            state_dir,
+            state_dirs,
         })
     }
 
-    /// Create CoreState from an existing Config (for in-memory / test use).
+    /// Create CoreState from an existing Config.
     pub fn from_config(config: Config, config_path: PathBuf) -> Self {
-        let state_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let usage_store = UsageStore::new(config.server.usage.clone())
-            .ok()
+        let config_dir = config_path.parent().unwrap_or(Path::new("."));
+        let state_dirs = crate::service::StateDirs::resolve(config_dir);
+        let usage_store = config
+            .server
+            .as_ref()
+            .map(|s| s.usage.clone())
+            .and_then(|usage| UsageStore::new_with_state_dir(usage, &state_dirs.state_dir).ok())
             .map(Arc::new);
         Self {
             config,
             usage_store,
             config_path,
-            state_dir,
+            state_dirs,
         }
     }
 
-    /// Load core state, sharing an externally-created usage store（§14 内存权威单一实例）。
+    /// Create CoreState with an explicit runtime directory.
+    ///
+    /// Tests use this constructor to isolate the cross-process config lock
+    /// without changing process-wide path environment variables.
+    pub fn from_config_with_state_dirs(
+        config: Config,
+        config_path: PathBuf,
+        state_dirs: crate::service::StateDirs,
+    ) -> Self {
+        let usage_store = config
+            .server
+            .as_ref()
+            .map(|s| s.usage.clone())
+            .and_then(|usage| UsageStore::new_with_state_dir(usage, &state_dirs.state_dir).ok())
+            .map(Arc::new);
+        Self {
+            config,
+            usage_store,
+            config_path,
+            state_dirs,
+        }
+    }
+
+    /// Load core state, sharing an externally-created usage store（内存权威单一实例）。
     pub fn load_with_usage_store(
         config_path: &Path,
         usage_store: Option<Arc<UsageStore>>,
@@ -90,9 +122,23 @@ impl CoreState {
         &mut self.config
     }
 
+    pub(crate) fn replace_config_in_memory(&mut self, config: Config) {
+        self.config = config;
+    }
+
     /// Get the usage store if available.
     pub fn usage_store(&self) -> Option<&UsageStore> {
         self.usage_store.as_ref().map(|arc| arc.as_ref())
+    }
+
+    /// Get an owned clone of the shared usage store Arc if available.
+    pub fn usage_store_arc(&self) -> Option<Arc<UsageStore>> {
+        self.usage_store.clone()
+    }
+
+    #[cfg(test)]
+    pub fn set_usage_store(&mut self, usage_store: Option<Arc<UsageStore>>) {
+        self.usage_store = usage_store;
     }
 
     /// Get the config path.
@@ -100,9 +146,14 @@ impl CoreState {
         &self.config_path
     }
 
-    /// Get the state directory.
-    pub fn state_dir(&self) -> &Path {
-        &self.state_dir
+    /// Get the per-instance state directories.
+    pub fn state_dirs(&self) -> &crate::service::StateDirs {
+        &self.state_dirs
+    }
+
+    /// Get the runtime directory (for cross-process locks and socket paths).
+    pub fn runtime_dir(&self) -> &Path {
+        &self.state_dirs.runtime_dir
     }
 
     /// Save config to disk.
@@ -122,11 +173,11 @@ impl CoreState {
     /// sides must hold the same flock before touching config.toml, otherwise a
     /// concurrent read-modify-write from the other side loses updates.
     fn with_config_file_lock<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
-        let _lock = ConfigLock::acquire(&self.state_dir, Duration::from_secs(5))?;
+        let _lock = ConfigLock::acquire(&self.state_dirs.runtime_dir, Duration::from_secs(5))?;
         f()
     }
 
-    /// 整体替换配置（TUI 编辑器保存的 server 侧执行，C1 根治）：
+    /// 整体替换配置（TUI 编辑器保存的 server 侧执行）：
     /// 持锁写盘 + 更新内存，保持单一写者模型下的内存/盘一致。
     pub fn update_full_config(&mut self, cfg: &Config) -> Result<()> {
         cfg.validate()?;
@@ -137,8 +188,147 @@ impl CoreState {
         Ok(())
     }
 
+    /// Reconcile catalog model bindings without writing to disk.
+    pub fn reselect_provider_models_candidate(
+        &self,
+        provider_id: &str,
+        selected_models: &[String],
+    ) -> Result<Config> {
+        let mut updated = self.config.clone();
+        crate::catalog::reselect_catalog_model_bindings(
+            &mut updated,
+            provider_id,
+            selected_models,
+        )?;
+        updated.validate()?;
+        Ok(updated)
+    }
+
+    /// Reconcile catalog model bindings for an existing provider while preserving
+    /// all non-catalog model metadata and unrelated provider bindings.
+    pub fn reselect_provider_models(
+        &mut self,
+        provider_id: &str,
+        selected_models: &[String],
+    ) -> Result<()> {
+        let updated = self.reselect_provider_models_candidate(provider_id, selected_models)?;
+        let mut before = self.config.clone();
+        let affected_models = crate::catalog::reselect_catalog_model_bindings(
+            &mut before,
+            provider_id,
+            selected_models,
+        )?;
+        self.with_config_file_lock(|| {
+            crate::config_edit::write_models(&self.config_path, &updated, &affected_models)
+        })?;
+        self.config = updated;
+        Ok(())
+    }
+
+    /// Build a provider removal candidate without writing to disk.
+    pub fn remove_provider_candidate(&self, id: &str, force: bool) -> Result<Config> {
+        let mut updated = self.config.clone();
+        let references = self.provider_references(id);
+        let review_references = updated.codex_review_provider_references(id);
+        if !review_references.is_empty() {
+            bail!(
+                "cannot remove provider {id:?}; it provides Codex auto-review bindings: {}",
+                review_references.join(", ")
+            );
+        }
+        if !references.is_empty() && !force {
+            bail!(
+                "provider {id:?} is still referenced by model bindings: {}; \
+                 remove them with `model provider remove` first",
+                references.join(", ")
+            );
+        }
+        if !updated.providers.contains_key(id) {
+            bail!("unknown provider {id:?}");
+        }
+        updated.providers.remove(id);
+        if force {
+            for model in updated.models.values_mut() {
+                model.openai_chat_providers.retain(|b| b.name != id);
+                model.openai_responses_providers.retain(|b| b.name != id);
+                model.anthropic_providers.retain(|b| b.name != id);
+            }
+        }
+        updated.validate()?;
+        Ok(updated)
+    }
+
+    /// Build a provider copy candidate without writing to disk.
+    pub fn copy_provider_candidate(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        api_key_env: Option<String>,
+        no_api_key: bool,
+    ) -> Result<(Config, CopyProviderResult)> {
+        let mut updated = self.config.clone();
+        if api_key_env.is_some() && no_api_key {
+            bail!("--api-key-env and --no-api-key are mutually exclusive");
+        }
+        if updated.providers.contains_key(target_id) {
+            bail!("provider {target_id:?} already exists");
+        }
+        let mut provider = updated
+            .providers
+            .get(source_id)
+            .with_context(|| format!("unknown provider {source_id:?}"))?
+            .clone();
+        let source_auth = provider.auth_config(source_id)?;
+        let mut requires_oauth_login = false;
+        match source_auth {
+            AuthConfig::ApiKeyEnv { .. } => {
+                if no_api_key {
+                    provider.api_key_env = None;
+                    provider.auth = Some(AuthConfig::None);
+                } else {
+                    let env = api_key_env.with_context(|| {
+                        format!(
+                            "provider copy for API-key provider {source_id:?} requires --api-key-env ENV"
+                        )
+                    })?;
+                    provider.api_key_env = Some(env);
+                    provider.auth = None;
+                }
+            }
+            AuthConfig::OpenaiOauth { .. } => {
+                provider.api_key_env = None;
+                provider.auth = Some(AuthConfig::OpenaiOauth {
+                    account: Some(target_id.to_string()),
+                });
+                requires_oauth_login = true;
+            }
+            AuthConfig::None => {
+                if api_key_env.is_some() {
+                    bail!("cannot add --api-key-env when copying no-auth provider {source_id:?}");
+                }
+                provider.api_key_env = None;
+                provider.auth = Some(AuthConfig::None);
+            }
+        }
+        updated.providers.insert(target_id.to_string(), provider);
+        updated.validate()?;
+        Ok((
+            updated,
+            CopyProviderResult {
+                requires_oauth_login,
+            },
+        ))
+    }
+
     /// Remove a provider by ID. Returns error if still referenced by models.
     pub fn remove_provider(&mut self, id: &str) -> Result<()> {
+        let review_references = self.config.codex_review_provider_references(id);
+        if !review_references.is_empty() {
+            bail!(
+                "cannot remove provider {id:?}; it provides Codex auto-review bindings: {}",
+                review_references.join(", ")
+            );
+        }
         // Check model bindings reference this provider
         let references: Vec<String> = self
             .config
@@ -171,6 +361,13 @@ impl CoreState {
 
     /// Force-remove a provider even if referenced by models.
     pub fn force_remove_provider(&mut self, id: &str) -> Result<()> {
+        let review_references = self.config.codex_review_provider_references(id);
+        if !review_references.is_empty() {
+            bail!(
+                "cannot force-remove provider {id:?}; it provides Codex auto-review bindings: {}",
+                review_references.join(", ")
+            );
+        }
         if !self.config.providers.contains_key(id) {
             bail!("unknown provider {id:?}");
         }
@@ -194,6 +391,13 @@ impl CoreState {
     pub fn remove_provider_with_oauth(&mut self, id: &str, force: bool) -> Result<()> {
         // Check references first
         let references = self.provider_references(id);
+        let review_references = self.config.codex_review_provider_references(id);
+        if !review_references.is_empty() {
+            bail!(
+                "cannot remove provider {id:?}; it provides Codex auto-review bindings: {}",
+                review_references.join(", ")
+            );
+        }
         if !references.is_empty() && !force {
             bail!(
                 "provider {id:?} is still referenced by model bindings: {}; \
@@ -225,9 +429,25 @@ impl CoreState {
             crate::config_edit::remove_provider(&self.config_path, &self.config, id)
         })?;
 
-        // Clean up OAuth account
+        // Clean up OAuth account. standalone 孪生：这里没有
+        // 进程内凭据缓存可刷，但同样不能用 `let _ =` 吞掉失败——凭据没删掉却向用户
+        // 报成功，留下的就是"配置里 provider 已消失、磁盘上账号仍在"的孤儿凭据，
+        // 与崩溃落在两步之间的终态相同，只是成因从 crash 变成静默吞错。
+        // 配置已落盘、无法回滚，所以把失败连同"哪一半已经生效"一起上报。
         if let Some(account) = account {
-            let _ = crate::auth::logout(&crate::auth::default_state_path(), Some(&account));
+            let accounts_path = crate::auth::state_path_for_config(&self.config_path);
+            if let Err(err) = crate::auth::logout(&accounts_path, Some(&account)) {
+                tracing::error!(
+                    provider = %id,
+                    error = %err,
+                    "provider removed but OAuth account cleanup failed"
+                );
+                anyhow::bail!(
+                    "provider '{id}' was removed, but its OAuth account could not be deleted: \
+                     {err}. The credential may still be on disk; run `llm-proxy provider logout \
+                     {id}` once the credentials store is usable again."
+                );
+            }
         }
 
         Ok(())
@@ -291,13 +511,6 @@ impl CoreState {
             AuthConfig::OpenaiOauth { .. } => {
                 provider.api_key_env = None;
                 provider.auth = Some(AuthConfig::OpenaiOauth {
-                    account: Some(target_id.to_string()),
-                });
-                requires_oauth_login = true;
-            }
-            AuthConfig::AntigravityOauth { .. } => {
-                provider.api_key_env = None;
-                provider.auth = Some(AuthConfig::AntigravityOauth {
                     account: Some(target_id.to_string()),
                 });
                 requires_oauth_login = true;
@@ -391,7 +604,6 @@ impl CoreState {
             let auth = match entry.provider.auth_config(entry.id) {
                 Ok(AuthConfig::ApiKeyEnv { env }) => env,
                 Ok(AuthConfig::OpenaiOauth { .. }) => "openai_oauth".to_string(),
-                Ok(AuthConfig::AntigravityOauth { .. }) => "antigravity_oauth".to_string(),
                 Ok(AuthConfig::None) | Err(_) => "none".to_string(),
             };
             let url = entry
@@ -446,24 +658,10 @@ impl CoreState {
         model: Option<&str>,
         endpoint: Option<&str>,
     ) -> Vec<UsageRecord> {
-        let store = match &self.usage_store {
-            Some(s) => s,
-            None => return Vec::new(),
-        };
-
-        let mut records = store.get_by_period(start, end);
-
-        if let Some(p) = provider {
-            records.retain(|r| r.provider == p);
+        match &self.usage_store {
+            Some(store) => store.query(start, end, provider, model, endpoint),
+            None => Vec::new(),
         }
-        if let Some(m) = model {
-            records.retain(|r| r.model == m);
-        }
-        if let Some(e) = endpoint {
-            records.retain(|r| r.endpoint == e);
-        }
-
-        records
     }
 
     /// Execute an admin command. Single dispatch point for all operations.
@@ -584,8 +782,7 @@ impl std::fmt::Debug for ConfigLock {
 impl ConfigLock {
     /// Acquire an exclusive lock, waiting up to `timeout`.
     pub fn acquire(state_dir: &Path, timeout: Duration) -> Result<Self> {
-        fs::create_dir_all(state_dir)
-            .with_context(|| format!("failed to create state dir {}", state_dir.display()))?;
+        crate::service::ensure_private_state_dir(state_dir)?;
         let lock_path = state_dir.join("config.lock");
         let file = File::create(&lock_path)
             .with_context(|| format!("failed to create lock file {}", lock_path.display()))?;
@@ -664,7 +861,9 @@ fn process_alive(pid: u32) -> bool {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if handle == 0 as _ {
@@ -783,6 +982,28 @@ mod tests {
             }
             _ => panic!("expected StatusInfo response"),
         }
+    }
+
+    #[test]
+    fn core_usage_store_uses_config_identity_shard_not_global_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = write_test_config(dir.path());
+        let core = CoreState::load(&config_path).unwrap();
+        let store = core.usage_store().expect("usage store");
+        let shard = crate::service::StateDirs::resolve(dir.path())
+            .state_dir
+            .join("usage.db");
+        assert_eq!(
+            store.db_path(),
+            &shard,
+            "usage store must follow the config's own identity shard"
+        );
+        let global = crate::service::state_dir().join("usage.db");
+        assert_ne!(
+            store.db_path(),
+            &global,
+            "global default shard would mint an empty identity dir on every injected-config run"
+        );
     }
 
     #[test]
@@ -908,14 +1129,20 @@ mod tests {
     #[test]
     fn core_from_config_accessors_and_mutation() {
         let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let config = crate::config::default_deepseek_config();
-        let mut core = CoreState::from_config(config, config_path.clone());
+        let state_dirs = crate::service::StateDirs::for_test(runtime_dir.path());
+        let mut core =
+            CoreState::from_config_with_state_dirs(config, config_path.clone(), state_dirs);
 
         assert_eq!(core.config_path(), config_path);
-        assert_eq!(core.state_dir(), dir.path());
-        core.config_mut().server.listen = "127.0.0.1:19090".to_string();
-        assert_eq!(core.config().server.listen, "127.0.0.1:19090");
+        assert_eq!(core.runtime_dir(), runtime_dir.path().join("runtime"));
+        core.config_mut().server.as_mut().unwrap().listen = "127.0.0.1:19090".to_string();
+        assert_eq!(
+            core.config().server.as_ref().unwrap().listen,
+            "127.0.0.1:19090"
+        );
     }
 
     #[test]
@@ -923,7 +1150,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = crate::config::default_deepseek_config();
         let usage = crate::usage_stats::UsageStore::with_paths(
-            config.server.usage.clone(),
+            config.server.as_ref().unwrap().usage.clone(),
             dir.path().join("usage.jsonl"),
             dir.path().join("usage.db"),
         )
@@ -954,11 +1181,38 @@ mod tests {
     }
 
     #[test]
+    fn core_usage_store_arc_getter() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::default_deepseek_config();
+        let without_store = CoreState::from_config_with_usage_store(
+            config.clone(),
+            dir.path().join("config1.toml"),
+            None,
+        );
+        assert!(without_store.usage_store_arc().is_none());
+
+        let usage = Arc::new(
+            crate::usage_stats::UsageStore::with_paths(
+                config.server.as_ref().unwrap().usage.clone(),
+                dir.path().join("usage.jsonl"),
+                dir.path().join("usage.db"),
+            )
+            .unwrap(),
+        );
+        let with_store = CoreState::from_config_with_usage_store(
+            config,
+            dir.path().join("config2.toml"),
+            Some(usage),
+        );
+        assert!(with_store.usage_store_arc().is_some());
+    }
+
+    #[test]
     fn core_query_usage_filters_independently() {
         let dir = tempfile::tempdir().unwrap();
         let config = crate::config::default_deepseek_config();
         let usage = crate::usage_stats::UsageStore::with_paths(
-            config.server.usage.clone(),
+            config.server.as_ref().unwrap().usage.clone(),
             dir.path().join("usage.jsonl"),
             dir.path().join("usage.db"),
         )
@@ -995,7 +1249,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = crate::config::default_deepseek_config();
         let usage = crate::usage_stats::UsageStore::with_paths(
-            config.server.usage.clone(),
+            config.server.as_ref().unwrap().usage.clone(),
             dir.path().join("usage.jsonl"),
             dir.path().join("usage.db"),
         )
@@ -1045,11 +1299,14 @@ mod tests {
         let config_path = write_test_config(dir.path());
         let mut core = CoreState::load(&config_path).unwrap();
         let mut changed = core.config().clone();
-        changed.server.listen = "127.0.0.1:19191".to_string();
+        changed.server.as_mut().unwrap().listen = "127.0.0.1:19191".to_string();
         crate::config_edit::write_full_config(&config_path, &changed).unwrap();
 
         core.reload_config().unwrap();
-        assert_eq!(core.config().server.listen, "127.0.0.1:19191");
+        assert_eq!(
+            core.config().server.as_ref().unwrap().listen,
+            "127.0.0.1:19191"
+        );
     }
 
     #[test]
@@ -1058,7 +1315,7 @@ mod tests {
         let config_path = write_test_config(dir.path());
         let mut core = CoreState::load(&config_path).unwrap();
         let mut changed = core.config().clone();
-        changed.server.listen = "127.0.0.1:19192".to_string();
+        changed.server.as_mut().unwrap().listen = "127.0.0.1:19192".to_string();
         crate::config_edit::write_full_config(&config_path, &changed).unwrap();
 
         let result = core.apply(AdminCommand::ConfigReload).unwrap();
@@ -1066,7 +1323,10 @@ mod tests {
             AdminResponse::Ok { message } => assert_eq!(message, "config reloaded"),
             _ => panic!("expected Ok"),
         }
-        assert_eq!(core.config().server.listen, "127.0.0.1:19192");
+        assert_eq!(
+            core.config().server.as_ref().unwrap().listen,
+            "127.0.0.1:19192"
+        );
     }
 
     #[test]
@@ -1100,6 +1360,23 @@ mod tests {
     }
 
     #[test]
+    fn core_force_remove_provider_preserves_codex_review_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = write_test_config(dir.path());
+        let mut core = CoreState::load(&config_path).unwrap();
+        let mut cfg = core.config().clone();
+        cfg.codex.auto_review_model = Some("deepseek-v4-flash-lp".to_string());
+        core.update_full_config(&cfg).unwrap();
+
+        let err = core
+            .force_remove_provider("deepseek")
+            .expect_err("review provider removal must be blocked")
+            .to_string();
+        assert!(err.contains("Codex auto-review bindings"));
+        assert!(core.config().providers.contains_key("deepseek"));
+    }
+
+    #[test]
     fn core_remove_provider_unknown_errors() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = write_test_config(dir.path());
@@ -1112,6 +1389,39 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unknown provider"));
+    }
+
+    #[test]
+    fn core_remove_provider_with_oauth_reports_cleanup_failure() {
+        // standalone 孪生回归基线：`remove_provider_with_oauth` 不能
+        // 用 `let _ =` 吞掉凭据删除失败——配置已落盘无法回滚，必须把失败连同
+        // "哪一半已生效"一起上报。修复前该场景静默返回 Ok。
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut cfg: crate::config::Config = toml::from_str(
+            "[server]\nlisten = \"127.0.0.1:0\"\n\n\
+             [providers.ag1]\n\
+             auth = { type = \"openai_oauth\", account = \"ag1\" }\n\
+             [providers.ag1.openai_chat]\nurl = \"https://example.test/v1/chat\"\n",
+        )
+        .unwrap();
+        cfg.models.clear();
+        crate::config_edit::write_full_config(&config_path, &cfg).unwrap();
+        // Make the credentials path a directory: any load inside logout fails.
+        std::fs::create_dir(crate::auth::state_path_for_config(&config_path)).unwrap();
+
+        let mut core = CoreState::load(&config_path).unwrap();
+        let err = core
+            .remove_provider_with_oauth("ag1", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("was removed"), "unexpected error: {err}");
+        assert!(
+            err.contains("could not be deleted"),
+            "unexpected error: {err}"
+        );
+        // The config half did take effect and cannot be rolled back.
+        assert!(!core.config().providers.contains_key("ag1"));
     }
 
     #[test]
@@ -1170,7 +1480,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Phase 1 P0: core.rs simple function tests
+    // core.rs simple function tests
     // =========================================================================
 
     #[test]
@@ -1182,6 +1492,8 @@ mod tests {
             UsageStore::with_paths(
                 crate::config::default_deepseek_config()
                     .server
+                    .as_ref()
+                    .unwrap()
                     .usage
                     .clone(),
                 dir.path().join("external-usage.jsonl"),
@@ -1208,7 +1520,7 @@ mod tests {
         let config = crate::config::default_deepseek_config();
         let external_store = Arc::new(
             UsageStore::with_paths(
-                config.server.usage.clone(),
+                config.server.as_ref().unwrap().usage.clone(),
                 dir.path().join("shared.jsonl"),
                 dir.path().join("shared.db"),
             )
@@ -1239,12 +1551,15 @@ mod tests {
     fn test_config_mut_returns_mutable_ref() {
         let dir = tempfile::tempdir().unwrap();
         let config = crate::config::default_deepseek_config();
-        let original_listen = config.server.listen.clone();
+        let original_listen = config.server.as_ref().unwrap().listen.clone();
         let mut core = CoreState::from_config(config, dir.path().join("config.toml"));
         // Verify config_mut returns a mutable reference we can modify
         let new_listen = "127.0.0.1:29999".to_string();
-        core.config_mut().server.listen = new_listen.clone();
-        assert_eq!(core.config().server.listen, new_listen);
-        assert_ne!(core.config().server.listen, original_listen);
+        core.config_mut().server.as_mut().unwrap().listen = new_listen.clone();
+        assert_eq!(core.config().server.as_ref().unwrap().listen, new_listen);
+        assert_ne!(
+            core.config().server.as_ref().unwrap().listen,
+            original_listen
+        );
     }
 }

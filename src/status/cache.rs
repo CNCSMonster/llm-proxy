@@ -6,7 +6,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Probe result enum for Singleflight coordination (§19.6).
+use crate::config::ReasoningLevelEntry;
+
+/// Probe result enum for Singleflight coordination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeResult {
     /// Provider is active (has successful requests within TTL)
@@ -74,8 +76,8 @@ pub struct DynamicModelCacheEntry {
     pub max_output_tokens: Option<i64>,
     pub features: Vec<String>,
     pub supported_parameters: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub supported_reasoning_levels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_levels: Option<Vec<ReasoningLevelEntry>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_reasoning_level: Option<String>,
 }
@@ -136,16 +138,18 @@ pub fn write_cache(path: &Path, cache: &StatusCache) -> Result<()> {
     crate::config_edit::atomic_write(path, data.as_bytes())
 }
 
+/// Default-instance status cache path.
+///
+/// # 分类标注
+///
+/// 全局便捷函数——只可用于 CLI 单进程工具（如 `status` 命令）。
+/// Server 路径必须用 `cache_path_in(&dirs.state_dir)`。
 pub fn cache_path() -> PathBuf {
-    // 测试/隔离场景可通过 LLM_PROXY_STATE_DIR 覆盖 state 目录，
-    // 避免测试读写与运行中 server 共享的 status-cache.json。
-    let dir = std::env::var("LLM_PROXY_STATE_DIR")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(dirs::state_dir)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("state")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    dir.join("llm-proxy").join("status-cache.json")
+    cache_path_in(&crate::service::state_dir())
+}
+
+pub fn cache_path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join("status-cache.json")
 }
 
 pub(super) fn unix_now() -> u64 {

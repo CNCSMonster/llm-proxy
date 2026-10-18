@@ -23,19 +23,28 @@ pub async fn run_usage(config_path: &std::path::Path, args: UsageArgs) -> Result
     // Try server delegation first（§13：版本不兼容时报错退出）
     match admin_client::detect_server(config_path).await {
         Ok(Some(server)) => {
+            crate::ownership::ensure_same_config(&server, config_path)?;
             let result = server
                 .usage(
                     args.period.as_deref(),
                     args.provider.as_deref(),
                     args.model.as_deref(),
                     args.endpoint.as_ref().map(|e| e.as_str()),
+                    Some(args.limit),
+                    Some(args.offset),
                 )
                 .await;
             match result {
                 Ok(resp) => {
                     // 写缓存：远程模式 server 不可达时兜底（usage 纳入统一缓存机制）
                     let key = format!("usage:{}", usage_cache_key(&args));
-                    let _ = cache::QueryCache::new().save(&key, &resp);
+                    let _ = cache::QueryCache::new_in(
+                        &crate::service::StateDirs::resolve(
+                            config_path.parent().unwrap_or(std::path::Path::new(".")),
+                        )
+                        .state_dir,
+                    )
+                    .save(&key, &resp);
                     print_usage_response(&resp, args.json)?;
                     return Ok(());
                 }
@@ -52,7 +61,12 @@ pub async fn run_usage(config_path: &std::path::Path, args: UsageArgs) -> Result
                 .unwrap_or(false);
             if is_remote {
                 let key = format!("usage:{}", usage_cache_key(&args));
-                let cache = cache::QueryCache::new();
+                let cache = cache::QueryCache::new_in(
+                    &crate::service::StateDirs::resolve(
+                        config_path.parent().unwrap_or(std::path::Path::new(".")),
+                    )
+                    .state_dir,
+                );
                 if let Some((cached_at, resp)) = cache.load(&key) {
                     println!(
                         "ℹ 从缓存获取（{}，可能过期）",
@@ -98,6 +112,22 @@ fn print_usage_response(result: &serde_json::Value, json: bool) -> Result<()> {
                 println!("No usage records found.");
                 return Ok(());
             }
+
+            // Print pagination warning if truncated
+            if let (Some(total), Some(records_count)) = (
+                data.get("total").and_then(|v| v.as_u64()),
+                data.get("count").and_then(|v| v.as_u64()),
+            ) && total > records_count
+            {
+                let limit = data.get("limit").and_then(|v| v.as_u64()).unwrap_or(0);
+                let offset = data.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                println!(
+                    "⚠ Showing {} of {} records (offset: {}, limit: {})",
+                    records_count, total, offset, limit
+                );
+                println!();
+            }
+
             println!("{}", serde_json::to_string_pretty(data)?);
         }
     }
@@ -110,7 +140,7 @@ fn run_usage_local(config_path: &std::path::Path, args: &UsageArgs) -> Result<()
     use usage_stats::UsageStore;
     let usage_config = if config_path.exists() {
         let cfg = config::Config::load(config_path)?;
-        cfg.server.usage.clone()
+        cfg.require_server()?.usage.clone()
     } else {
         UsageConfig::default()
     };
@@ -125,25 +155,38 @@ fn run_usage_local(config_path: &std::path::Path, args: &UsageArgs) -> Result<()
         (None, None)
     };
 
-    // Get records with filters
-    let mut records = store.get_by_period(start, end);
-
-    // Apply additional filters
-    if let Some(provider) = &args.provider {
-        records.retain(|r| &r.provider == provider);
-    }
-    if let Some(model) = &args.model {
-        records.retain(|r| &r.model == model);
-    }
-    if let Some(endpoint) = &args.endpoint {
-        records.retain(|r| r.endpoint == endpoint.as_str());
-    }
+    // Query with pagination directly from SQLite
+    let (records, total) = store.query_with_pagination(
+        start,
+        end,
+        args.provider.as_deref(),
+        args.model.as_deref(),
+        args.endpoint.as_ref().map(|e| e.as_str()),
+        args.limit,
+        args.offset,
+    )?;
 
     // Output based on format
     if args.json {
-        output_json(&records, args.view.as_str(), start, end)?;
+        output_json(
+            &records,
+            args.view.as_str(),
+            start,
+            end,
+            total,
+            args.limit,
+            args.offset,
+        )?;
     } else {
-        output_human_readable(&records, args.view.as_str(), start, end)?;
+        output_human_readable(
+            &records,
+            args.view.as_str(),
+            start,
+            end,
+            total,
+            args.limit,
+            args.offset,
+        )?;
     }
 
     Ok(())
@@ -293,6 +336,9 @@ fn output_json(
     view: &str,
     start: Option<chrono::DateTime<chrono::Utc>>,
     end: Option<chrono::DateTime<chrono::Utc>>,
+    total: usize,
+    limit: usize,
+    offset: usize,
 ) -> Result<()> {
     use std::collections::HashMap;
 
@@ -306,6 +352,12 @@ fn output_json(
         "period": {
             "start": start.map(|d| d.to_rfc3339()),
             "end": end.map(|d| d.to_rfc3339()),
+        },
+        "pagination": {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "count": request_count,
         },
         "summary": {
             "input_tokens": total_input,
@@ -481,6 +533,9 @@ fn output_human_readable(
     view: &str,
     start: Option<chrono::DateTime<chrono::Utc>>,
     end: Option<chrono::DateTime<chrono::Utc>>,
+    total: usize,
+    limit: usize,
+    offset: usize,
 ) -> Result<()> {
     use std::collections::HashMap;
 
@@ -506,6 +561,16 @@ fn output_human_readable(
     println!("Token Usage Summary ({})", period_str);
     println!("{}", "═".repeat(60));
     println!();
+
+    // Print pagination info if truncated
+    if total > request_count {
+        println!(
+            "⚠ Showing {} of {} records (offset: {}, limit: {})",
+            request_count, total, offset, limit
+        );
+        println!();
+    }
+
     println!("Total:");
     println!("  Input:    {:>12} tokens", format_number(total_input));
     println!("  Output:   {:>12} tokens", format_number(total_output));

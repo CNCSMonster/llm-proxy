@@ -1,37 +1,312 @@
+use std::collections::HashSet;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 
-use crate::config::{Config, Protocol};
+use crate::config::{Config, Protocol, ReasoningLevelEntry};
 
+use super::ProbeSelection;
 use super::cache::{
     ProbeCacheEntry, ProbeFrequencyLimiter, StatusCache, read_cache, unix_now, write_cache,
 };
 use super::display::{
-    print_auth, print_cooldowns, print_model_status, print_providers, print_runtime_state,
-    print_service_state,
+    AuthScope, print_auth, print_cooldowns, print_model_status, print_providers,
+    print_runtime_state, print_service_state,
 };
-use super::format::{badge, cyan, dim, format_latency, heading, label, protocol_label, section};
+use super::format::{
+    badge, cyan, dim, format_latency, heading, label, probe_key, protocol_label, red, section,
+};
 
-/// `llm-proxy status` 主入口（§12 Status 命令重构）。
+/// `llm-proxy status` 主入口。
 ///
-/// §12.2 两种场景：
+/// 两种场景：
 /// - Server 存活（本地/远程）→ 委托 Server（读实时状态 / 请求 Server 探活）
 /// - Server 未启动（本地）→ 独立模式（读缓存 / CLI 自己探活）
 ///
-/// §12.11 缓存更新时机：
+/// 缓存更新时机：
 /// - Server 可达：每次获取后更新本地缓存（作为不可达时的备份）
 /// - 独立 probe 成功：更新缓存；只读缓存：不写
-pub async fn print_status(config_path: &Path, cfg: &Config, probe: bool) -> Result<()> {
+pub async fn print_status(
+    config_path: &Path,
+    cfg: &Config,
+    probe: bool,
+    selection: &ProbeSelection,
+) -> Result<()> {
+    let probe_config_dir = config_path.parent().unwrap_or(std::path::Path::new("."));
+    let probe_dirs = crate::service::StateDirs::resolve(probe_config_dir);
+    print_status_with_cache_path(
+        config_path,
+        cfg,
+        probe,
+        selection,
+        super::cache::cache_path_in(&probe_dirs.state_dir),
+        &probe_dirs.runtime_dir,
+    )
+    .await
+}
+
+/// 消费 Server 委托探测（经管理通道送达）的 SSE 事件流并逐项打印。
+/// 收到 error 事件、流读取失败、或缺少 done 事件提前终止时返回 Err。
+pub(super) async fn consume_probe_stream<S>(mut stream: S) -> Result<()>
+where
+    S: futures_util::Stream<Item = Result<crate::admin_client::SseEvent>> + Unpin,
+{
+    let mut count = 0usize;
+    let mut done = false;
+    loop {
+        let next_item = match tokio::time::timeout(Duration::from_secs(60), stream.next()).await {
+            Ok(item) => item,
+            Err(_) => {
+                anyhow::bail!("server probe stream timed out waiting for next event (idle > 60s)");
+            }
+        };
+        let Some(event) = next_item else {
+            break;
+        };
+        match event {
+            Ok(event) if event.event == "probe_result" => {
+                count += 1;
+                let provider = event
+                    .data
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let model = event
+                    .data
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let protocol = event
+                    .data
+                    .get("protocol")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let ok = event
+                    .data
+                    .get("ok")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let latency = event
+                    .data
+                    .get("latency_ms")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| format!(" {v}ms"))
+                    .unwrap_or_default();
+                let mark = if ok { "✓" } else { "✗" };
+                println!("  [{count}] {mark} 探测 {provider} / {model} / {protocol}{latency}");
+            }
+            Ok(event) if event.event == "done" => {
+                println!("  ✓ {count} 个探测完成");
+                done = true;
+                break;
+            }
+            Ok(event) if event.event == "error" => {
+                let err_msg = event
+                    .data
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error")
+                    .to_string();
+                eprintln!("  ✗ Server 探活失败: {err_msg}");
+                anyhow::bail!("server probe failed: {err_msg}");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("  ✗ Server 探活流读取失败: {e}");
+                return Err(e);
+            }
+        }
+    }
+    if !done {
+        anyhow::bail!("server probe stream terminated unexpectedly before done event");
+    }
+    Ok(())
+}
+
+/// 拉取远端 `GET /admin/config/snapshot` 配置镜像。
+///
+/// 纯客户端（client-only）节点本地 `cfg` 的 providers/models 恒空，status 的
+/// 元数据渲染（Providers/Models 树）若直接遍历本地配置必然为空；远端在线时
+/// 改用该快照作为渲染源，与远端 `/admin/status` 回传的 probe cache 同源同代。
+/// 快照走公开 HTTP listener，与 `/admin/ping` 同一套 Bearer 鉴权，不引入新的
+/// 暴露面。响应携带的 `revision`（TUI 编辑器 CAS 用）不消费不展示，解析容忍
+/// 其缺失。
+#[derive(Debug)]
+pub(super) struct RemoteConfigSnapshot {
+    pub config: Config,
+    pub view: crate::client_view::ClientView,
+}
+
+pub(super) async fn fetch_remote_config_snapshot(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: Option<&str>,
+) -> Result<RemoteConfigSnapshot> {
+    let mut req = client.get(format!("{base_url}/admin/config/snapshot"));
+    if let Some(token) = token {
+        req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let resp = req
+        .send()
+        .await
+        .context("GET /admin/config/snapshot request failed")?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("GET /admin/config/snapshot returned {status}");
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .context("config snapshot response is not valid JSON")?;
+    let data = body
+        .get("data")
+        .context("config snapshot response has no data")?;
+    let mut config_value = data
+        .get("config")
+        .cloned()
+        .context("config snapshot response has no config")?;
+    for name in strip_unsupported_providers(&mut config_value) {
+        eprintln!("  ⚠ 远端 provider `{name}` 含本客户端不支持的配置，已在本地渲染中跳过");
+    }
+    let view: crate::client_view::ClientView = data
+        .get("view")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or(crate::client_view::ClientView::Client);
+    let config: Config =
+        serde_json::from_value(config_value).context("failed to parse config snapshot")?;
+    Ok(RemoteConfigSnapshot { config, view })
+}
+
+/// 远端快照可能携带本客户端不认识的 provider（例如更高版本服务端的扩展认证）。
+/// client-only status 不应因单个 provider 解析失败而整体中止：逐个试解析，
+/// 剔除失败的 provider，其余照常渲染。
+pub(crate) fn strip_unsupported_providers(config: &mut serde_json::Value) -> Vec<String> {
+    let Some(providers) = config.get_mut("providers").and_then(|v| v.as_object_mut()) else {
+        return Vec::new();
+    };
+    let unsupported: Vec<String> = providers
+        .iter()
+        .filter(|(_, value)| {
+            serde_json::from_value::<crate::config::ProviderConfig>((*value).clone()).is_err()
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in &unsupported {
+        providers.remove(name);
+    }
+    unsupported
+}
+
+fn is_better_probe(current: &ProbeCacheEntry, candidate: &ProbeCacheEntry) -> bool {
+    if candidate.ok != current.ok {
+        candidate.ok
+    } else {
+        candidate.checked_at_unix > current.checked_at_unix
+    }
+}
+
+/// Project the server's provider-keyed probe cache into the client view.
+///
+/// The client synthesizes a single `llm-proxy` provider, so its lookup key is
+/// `(model, "llm-proxy", protocol)`. For each visible model/protocol we pick
+/// the healthiest binding: any successful probe wins; ties go to the freshest
+/// entry. Provider topology never leaves the server.
+pub(crate) fn project_client_status_cache(
+    cfg: &Config,
+    cache: &StatusCache,
+    grant: Option<&crate::token::auth::TokenGrant>,
+) -> StatusCache {
+    let mut projected = StatusCache::default();
+    for (model_id, model) in &cfg.models {
+        if let Some(grant) = grant
+            && !grant.model_allowed(model_id)
+        {
+            continue;
+        }
+        for protocol in Protocol::CLIENT_PROTOCOLS {
+            if !cfg.model_serves_protocol(model_id, protocol) {
+                continue;
+            }
+
+            let mut best: Option<ProbeCacheEntry> = None;
+            let mut consider = |entry: &ProbeCacheEntry| {
+                if best
+                    .as_ref()
+                    .is_none_or(|current| is_better_probe(current, entry))
+                {
+                    best = Some(entry.clone());
+                }
+            };
+
+            if model.is_routing_model() {
+                for route in model.routes() {
+                    let Some(target) = cfg.models.get(&route.target) else {
+                        continue;
+                    };
+                    for binding in target.provider_bindings(protocol) {
+                        let key = probe_key(&route.target, &binding.name, protocol);
+                        if let Some(entry) = cache.probes.get(&key) {
+                            consider(entry);
+                        }
+                    }
+                }
+            } else {
+                for binding in model.provider_bindings(protocol) {
+                    let key = probe_key(model_id, &binding.name, protocol);
+                    if let Some(entry) = cache.probes.get(&key) {
+                        consider(entry);
+                    }
+                }
+            }
+
+            if let Some(mut entry) = best {
+                // Provider-specific errors may contain provider ids or upstream
+                // URLs; the client view only needs availability.
+                if entry.error.is_some() {
+                    entry.error = Some("probe failed".to_string());
+                }
+                projected
+                    .probes
+                    .insert(probe_key(model_id, "llm-proxy", protocol), entry);
+            }
+        }
+    }
+    projected
+}
+
+pub async fn print_status_with_cache_path(
+    config_path: &Path,
+    cfg: &Config,
+    probe: bool,
+    selection: &ProbeSelection,
+    cache_path: PathBuf,
+    runtime_dir: &Path,
+) -> Result<()> {
     cfg.validate()?;
-    let cache_path = super::cache::cache_path();
+    if let Some(ref p) = selection.provider {
+        crate::pattern::PatternMatcher::new(p).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    if let Some(ref m) = selection.model {
+        crate::pattern::PatternMatcher::new(m).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     let mut cache = read_cache(&cache_path).unwrap_or_default();
-    // §13：Server 版本不兼容时 detect_server 返回 Err，报错退出
-    let server = match crate::admin_client::detect_server(config_path).await {
-        Ok(Some(conn)) => Some(conn),
+    // Selector-bearing delegated probes use their own feature-version gate after a
+    // connectivity-only detection. All other status paths retain the generic compatibility gate.
+    let server = match if probe && !selection.is_empty() {
+        crate::admin_client::detect_server_for_probe_selection_at(config_path, runtime_dir).await
+    } else {
+        crate::admin_client::detect_server_at(config_path, runtime_dir).await
+    } {
+        Ok(Some(conn)) => {
+            // 读委托加 config_identity 门禁，不匹配或未上报硬拒绝
+            crate::ownership::ensure_same_config(&conn, config_path)?;
+            Some(conn)
+        }
         Ok(None) => None,
         Err(e) => anyhow::bail!("{e}"),
     };
@@ -43,8 +318,35 @@ pub async fn print_status(config_path: &Path, cfg: &Config, probe: bool) -> Resu
         badge("OK"),
         dim(&config_path.display().to_string())
     );
-    println!("{}  {}", label("Listen"), cfg.server.listen);
-    print_service_state(config_path);
+    if let Some(server) = cfg.server_config() {
+        println!("{}  {}", label("Listen"), server.listen);
+    } else if let Some(remote) = &cfg.remote {
+        println!("{}  {}", label("Remote"), remote.url);
+    }
+    // Show state/runtime directories for operational visibility
+    let status_config_dir = config_path.parent().unwrap_or(std::path::Path::new("."));
+    let status_dirs = crate::service::StateDirs::resolve(status_config_dir);
+    println!(
+        "{}  {}",
+        label("State"),
+        dim(&status_dirs.state_dir.display().to_string())
+    );
+    println!(
+        "{}  {}",
+        label("Runtime"),
+        dim(&status_dirs.runtime_dir.display().to_string())
+    );
+    if let Some(ref server) = cfg.server {
+        print_service_state(config_path, &server.listen);
+    } else if let Some(ref remote) = cfg.remote {
+        println!("{}  {}", label("Remote"), cyan(&remote.url));
+    } else {
+        println!(
+            "{}  {}",
+            label("Config"),
+            red("no server or remote configured")
+        );
+    }
     println!(
         "{}   {}",
         label("Probe"),
@@ -55,82 +357,29 @@ pub async fn print_status(config_path: &Path, cfg: &Config, probe: bool) -> Resu
         }
     );
 
-    // §12.10 数据来源提示
+    // 数据来源提示
+    // 远端在线时拉取配置镜像，供下方元数据渲染使用。
+    let mut remote_render_cfg: Option<Config> = None;
+    let mut remote_view: Option<crate::client_view::ClientView> = None;
     let mut server_mode = false;
     match &server {
         Some(conn) => {
             server_mode = true;
             if probe {
-                // 委托 Server 探活（§12.5/12.6），SSE 流式显示每个完成项。
-                match conn.status_probe_stream().await {
+                // 委托 Server 探活，SSE 流式显示每个完成项。
+                match conn.status_probe_stream(selection).await {
                     Ok(stream) => {
                         println!();
                         println!("{}", section("Online Probe (server)"));
-                        let mut count = 0usize;
-                        let mut stream = std::pin::pin!(stream);
-                        while let Some(event) = stream.next().await {
-                            match event {
-                                Ok(event) if event.event == "probe_result" => {
-                                    count += 1;
-                                    let provider = event
-                                        .data
-                                        .get("provider")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("?");
-                                    let model = event
-                                        .data
-                                        .get("model")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("?");
-                                    let protocol = event
-                                        .data
-                                        .get("protocol")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("?");
-                                    let ok = event
-                                        .data
-                                        .get("ok")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(false);
-                                    let latency = event
-                                        .data
-                                        .get("latency_ms")
-                                        .and_then(|v| v.as_u64())
-                                        .map(|v| format!(" {v}ms"))
-                                        .unwrap_or_default();
-                                    let mark = if ok { "✓" } else { "✗" };
-                                    println!(
-                                        "  [{count}] {mark} 探测 {provider} / {model} / {protocol}{latency}"
-                                    );
-                                }
-                                Ok(event) if event.event == "done" => {
-                                    println!("  ✓ {count} 个探测完成");
-                                    break;
-                                }
-                                Ok(event) if event.event == "error" => {
-                                    eprintln!(
-                                        "  ✗ Server 探活失败: {}",
-                                        event
-                                            .data
-                                            .get("error")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("unknown error")
-                                    );
-                                    break;
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    eprintln!("  ✗ Server 探活流读取失败: {e}");
-                                    break;
-                                }
-                            }
-                        }
+                        println!("  Selection: {}", selection.describe());
+                        consume_probe_stream(std::pin::pin!(stream)).await?;
                     }
                     Err(e) => {
                         eprintln!("  ✗ Server 探活失败: {e}");
                         eprintln!(
                             "  建议：检查 server 是否运行，或稍后重试。流式探测应在 30s 内完成；若仍超时请检查上游网络/API Key。"
                         );
+                        anyhow::bail!("{e}");
                     }
                 }
             } else {
@@ -138,47 +387,263 @@ pub async fn print_status(config_path: &Path, cfg: &Config, probe: bool) -> Resu
             }
         }
         None => {
-            // Server 不可达：判定本地/远程模式
-            let is_remote = cfg.providers.is_empty() && cfg.models.is_empty();
+            if let Some(remote) = &cfg.remote {
+                // 远程模式下的 status 探测
+                let base_url = remote.url.trim_end_matches('/');
+                let token_opt = cfg.resolve_remote_auth_token();
+                let client = match reqwest::Client::builder()
+                    .timeout(Duration::from_secs(10))
+                    .no_proxy()
+                    .build()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("  ✗ 初始化 HTTP client 失败: {e}");
+                        return Err(e.into());
+                    }
+                };
 
-            if probe {
-                if is_remote {
-                    // 远程模式 + probe：尝试失败 → 回退缓存
-                    println!("  ✗ 远程模式无法本地探测（Server 不可达）");
-                    let has_cache = !cache.probes.is_empty() || !cache.dynamic_models.is_empty();
-                    if has_cache {
-                        println!("  ⚠ 回退到本地缓存（可能过时）");
-                    } else {
-                        println!("  ✗ 无缓存数据");
+                let mut ping_req = client.get(format!("{base_url}/admin/ping"));
+                if let Some(ref token) = token_opt {
+                    ping_req =
+                        ping_req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+                }
+
+                match ping_req.send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        println!("  ✓ 远程 Server 在线 ({})", cyan(&remote.url));
+                        if let Ok(body) = resp.json::<serde_json::Value>().await
+                            && let Some(version) = body.get("version").and_then(|v| v.as_str())
+                        {
+                            println!("  ℹ 远程 Server 版本: {version}");
+                        }
+
+                        if probe {
+                            println!();
+                            println!("{}", section("Online Probe (remote)"));
+                            println!("  Selection: {}", selection.describe());
+
+                            let probe_client = match reqwest::Client::builder()
+                                .connect_timeout(Duration::from_secs(10))
+                                .read_timeout(Duration::from_secs(60))
+                                .no_proxy()
+                                .build()
+                            {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    eprintln!("  ✗ 初始化流式探活 HTTP client 失败: {e}");
+                                    return Err(e.into());
+                                }
+                            };
+
+                            let mut probe_req = probe_client
+                                .post(format!("{base_url}/admin/status/probe"))
+                                .header(reqwest::header::ACCEPT, "text/event-stream");
+                            if let Some(ref token) = token_opt {
+                                probe_req = probe_req.header(
+                                    reqwest::header::AUTHORIZATION,
+                                    format!("Bearer {token}"),
+                                );
+                            }
+                            if !selection.is_empty() {
+                                probe_req = probe_req
+                                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                                    .json(selection);
+                            }
+                            match probe_req.send().await {
+                                Ok(probe_resp) if probe_resp.status().is_success() => {
+                                    let is_sse = probe_resp
+                                        .headers()
+                                        .get(reqwest::header::CONTENT_TYPE)
+                                        .and_then(|v| v.to_str().ok())
+                                        .is_some_and(|v| v.contains("text/event-stream"));
+
+                                    if is_sse {
+                                        let stream =
+                                            crate::admin_client::response_to_sse_stream(probe_resp);
+                                        if let Err(e) =
+                                            consume_probe_stream(std::pin::pin!(stream)).await
+                                        {
+                                            eprintln!("  ✗ 远程流式探活失败: {e}");
+                                            return Err(e);
+                                        }
+                                    } else {
+                                        let _ = probe_resp.bytes().await;
+                                        println!("  ✓ 远程 Server 探活成功");
+                                    }
+                                }
+                                Ok(probe_resp) => {
+                                    let status = probe_resp.status();
+                                    let bytes = probe_resp.bytes().await.unwrap_or_default();
+                                    let bounded_len = bytes.len().min(65536);
+                                    let text =
+                                        String::from_utf8_lossy(&bytes[..bounded_len]).to_string();
+                                    let msg = if let Ok(body) =
+                                        serde_json::from_str::<serde_json::Value>(&text)
+                                    {
+                                        body.get("error")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string())
+                                            .unwrap_or(text)
+                                    } else if !text.trim().is_empty() {
+                                        text
+                                    } else {
+                                        format!("status {}", status)
+                                    };
+                                    eprintln!("  ✗ 远程 Server 探活返回错误: {msg}");
+                                    anyhow::bail!(
+                                        "remote probe failed with status {status}: {msg}"
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!("  ✗ 远程 Server 探活网络失败: {e}");
+                                    return Err(e.into());
+                                }
+                            }
+                        }
+
+                        // 尝试从远程获取最新 status 状态与 cache
+                        let mut status_req = client.get(format!("{base_url}/admin/status"));
+                        if let Some(ref token) = token_opt {
+                            status_req = status_req
+                                .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+                        }
+                        if let Ok(status_resp) = status_req.send().await
+                            && status_resp.status().is_success()
+                            && let Ok(status_json) = status_resp.json::<serde_json::Value>().await
+                            && let Some(server_cache) = status_json
+                                .get("data")
+                                .and_then(|d| d.get("cache"))
+                                .and_then(serde_json::Value::as_object)
+                            && let Ok(parsed) = serde_json::from_value::<StatusCache>(
+                                serde_json::Value::Object(server_cache.clone()),
+                            )
+                        {
+                            cache = parsed;
+                            if let Err(e) = write_cache(&cache_path, &cache) {
+                                eprintln!("  ⚠ 本地缓存更新失败: {e}");
+                            }
+                            println!("  ℹ 数据来自远程 Server（实时）");
+                        }
+
+                        // 元数据渲染源：client-only 节点本地 providers/models
+                        // 不承载流量，渲染源恒为远端配置镜像；快照失败即
+                        // fail-fast（不渲染半截状态、不回退本地口径）。
+                        match fetch_remote_config_snapshot(&client, base_url, token_opt.as_deref())
+                            .await
+                        {
+                            Ok(snapshot) => {
+                                println!("  ℹ 已加载远程配置快照");
+                                remote_view = Some(snapshot.view);
+                                remote_render_cfg = Some(snapshot.config);
+                            }
+                            Err(e) => {
+                                eprintln!("  ⚠ 获取远程配置快照失败: {e}");
+                                anyhow::bail!(
+                                    "client-only status requires the remote config snapshot; aborting without partial render"
+                                );
+                            }
+                        }
                     }
-                } else {
-                    // 本地模式 + probe：CLI 自己探活（§12.2 场景 2）
-                    println!();
-                    println!("{}", section("Online Probe"));
-                    run_online_probes(cfg, &mut cache).await;
-                    discover_dynamic_models(cfg, &mut cache).await;
-                    if let Err(e) = write_cache(&cache_path, &cache) {
-                        eprintln!("  ✗ 缓存写入失败: {e}");
+                    Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                        println!("  ✗ 远程 Server 认证失败 (HTTP 401: Unauthorized)");
+                        println!(
+                            "    建议：检查 [remote] 中的 auth_token_env 对应的环境变量是否已设置且与远程服务匹配。"
+                        );
                     }
-                    println!("  ✓ 已执行本地探测");
+                    Ok(resp) => {
+                        println!("  ✗ 远程 Server 返回异常状态: {}", resp.status());
+                    }
+                    Err(e) => {
+                        println!("  ✗ 远程 Server 不可达 ({e})");
+                        let has_cache =
+                            !cache.probes.is_empty() || !cache.dynamic_models.is_empty();
+                        if has_cache {
+                            println!("  ⚠ 回退到本地缓存（可能过时）");
+                        } else {
+                            println!("  ✗ 无缓存数据");
+                        }
+                    }
                 }
             } else {
-                let has_cache = !cache.probes.is_empty() || !cache.dynamic_models.is_empty();
-                if has_cache {
-                    println!("  ⚠ 数据来自本地缓存（Server 未启动，可能过时）");
+                // Server 不可达：判定本地/远程模式
+                let is_remote = cfg.providers.is_empty() && cfg.models.is_empty();
+
+                if probe {
+                    if is_remote {
+                        if !selection.is_empty() {
+                            anyhow::bail!(
+                                "cannot validate probe selection because the configured server is unavailable"
+                            );
+                        }
+                        // 远程模式 + probe：尝试失败 → 回退缓存
+                        println!("  ✗ 远程模式无法本地探测（Server 不可达）");
+                        let has_cache =
+                            !cache.probes.is_empty() || !cache.dynamic_models.is_empty();
+                        if has_cache {
+                            println!("  ⚠ 回退到本地缓存（可能过时）");
+                        } else {
+                            println!("  ✗ 无缓存数据");
+                        }
+                    } else {
+                        // 本地模式 + probe：CLI 自己探活
+                        if !selection.is_empty()
+                            && let Err(err) = selection.validate(cfg)
+                        {
+                            anyhow::bail!("{err}");
+                        }
+                        println!();
+                        println!("{}", section("Online Probe"));
+                        println!("  Selection: {}", selection.describe());
+                        run_online_probes(config_path, cfg, &mut cache, selection).await;
+                        discover_dynamic_models(
+                            cfg,
+                            &mut cache,
+                            selection,
+                            &crate::auth::state_path_for_config(config_path),
+                        )
+                        .await;
+                        if let Err(e) = write_cache(&cache_path, &cache) {
+                            eprintln!("  ✗ 缓存写入失败: {e}");
+                        }
+                        println!("  ✓ 已执行本地探测");
+                    }
                 } else {
-                    println!("  ✗ Server 未启动，无缓存数据");
+                    let has_cache = !cache.probes.is_empty() || !cache.dynamic_models.is_empty();
+                    if has_cache {
+                        println!("  ⚠ 数据来自本地缓存（Server 未启动，可能过时）");
+                    } else {
+                        println!("  ✗ Server 未启动，无缓存数据");
+                    }
                 }
             }
         }
     }
 
-    print_providers(cfg);
-    print_auth(&crate::auth::default_state_path());
-    print_cooldowns(&crate::cooldown::default_state_path());
-    print_runtime_state();
+    let accounts_path = crate::auth::state_path_for_config(config_path);
+    // 元数据渲染源选择：远端在线时渲染源恒为远端配置镜像（快照失败已在上方
+    // fail-fast，不会到达此处）；远端不可达或本地 Server 场景使用本地配置
+    // （本地 Server 与本地 cfg 同源）。运行态判定始终用本地 cfg：快照里的
+    // [server] 属于远端，误传会把部署模式判回本地。
+    let render_cfg: &Config = remote_render_cfg.as_ref().unwrap_or(cfg);
+    let auth_scope = if remote_render_cfg.is_some() {
+        AuthScope::RemoteManaged
+    } else {
+        AuthScope::Local
+    };
+    let client_view = matches!(remote_view, Some(crate::client_view::ClientView::Client));
+    if !client_view {
+        print_providers(render_cfg, config_path, selection, auth_scope);
+        print_auth(&accounts_path, render_cfg, selection);
+        let cooldown_state_dir = {
+            let cd = config_path.parent().unwrap_or(std::path::Path::new("."));
+            crate::service::StateDirs::resolve(cd).state_dir
+        };
+        print_cooldowns(&cooldown_state_dir.join("cooldowns.json"), selection);
+    }
+    print_runtime_state(config_path, cfg);
 
-    // §12.11：Server 可达 → 每次获取后更新本地缓存；只读缓存不写
+    // Server 可达 → 每次获取后更新本地缓存；只读缓存不写
     if server_mode {
         let conn = server.as_ref().expect("server_mode implies Some");
         match conn.status().await {
@@ -204,16 +669,18 @@ pub async fn print_status(config_path: &Path, cfg: &Config, probe: bool) -> Resu
         }
     }
 
-    print_model_status(cfg, &cache);
+    print_model_status(render_cfg, &cache, selection, client_view);
 
     Ok(())
 }
 
-pub(super) async fn run_online_probes(cfg: &Config, cache: &mut StatusCache) {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-    {
+pub(super) async fn run_online_probes(
+    config_path: &Path,
+    cfg: &Config,
+    cache: &mut StatusCache,
+    selection: &ProbeSelection,
+) {
+    let client = match crate::http_client::try_build_with_timeout(cfg, Duration::from_secs(30)) {
         Ok(client) => client,
         Err(err) => {
             println!("  client init failed: {err}");
@@ -221,10 +688,28 @@ pub(super) async fn run_online_probes(cfg: &Config, cache: &mut StatusCache) {
         }
     };
 
+    let candidates = selection.candidates(cfg);
+    let candidate_set: HashSet<(&str, &str, Protocol)> = candidates
+        .iter()
+        .map(|(p, m, proto)| (p.as_str(), m.as_str(), *proto))
+        .collect();
+
+    // load cooldown store from disk for the CLI probe path so
+    // probes respect cooldowns set by the forwarding path (and vice versa).
+    let cooldown_store_dir = {
+        let d = config_path.parent().unwrap_or(std::path::Path::new("."));
+        crate::service::StateDirs::resolve(d).state_dir
+    };
+    let cooldown_store =
+        crate::cooldown::CooldownStore::load(cooldown_store_dir.join("cooldowns.json")).ok();
+
     let mut limiter = ProbeFrequencyLimiter::default();
     for (model_id, model) in &cfg.models {
         for protocol in Protocol::CLIENT_PROTOCOLS {
             for binding in model.provider_bindings(protocol) {
+                if !candidate_set.contains(&(&binding.name[..], model_id.as_str(), protocol)) {
+                    continue;
+                }
                 let Some((_id, plan)) = cfg
                     .resolve_model_request_candidates(protocol, model_id)
                     .into_iter()
@@ -232,8 +717,8 @@ pub(super) async fn run_online_probes(cfg: &Config, cache: &mut StatusCache) {
                 else {
                     continue;
                 };
+                let key = super::format::probe_key(model_id, &binding.name, protocol);
                 if !limiter.acquire(&plan).await {
-                    let key = super::format::probe_key(model_id, &binding.name, protocol);
                     cache.probes.insert(
                         key,
                         ProbeCacheEntry {
@@ -255,7 +740,9 @@ pub(super) async fn run_online_probes(cfg: &Config, cache: &mut StatusCache) {
                     );
                     continue;
                 }
+                let cooldown_cfg = cfg.effective_cooldown(model_id, &binding.name);
                 run_one_online_probe(
+                    config_path,
                     cfg,
                     cache,
                     &client,
@@ -263,8 +750,27 @@ pub(super) async fn run_online_probes(cfg: &Config, cache: &mut StatusCache) {
                     protocol,
                     &binding.name,
                     &plan,
+                    cooldown_store.as_ref(),
+                    &cooldown_cfg,
                 )
                 .await;
+
+                // 探测之间引入平滑间隔与抖动，避免秒级连续请求轰炸
+                let interval_ms = cfg.status.probe_interval_ms;
+                let jitter_ms = cfg.status.probe_interval_jitter_ms;
+                if interval_ms > 0 || jitter_ms > 0 {
+                    let jitter = if jitter_ms > 0 {
+                        use std::time::SystemTime;
+                        let nanos = SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .map(|d| d.subsec_nanos() as u64)
+                            .unwrap_or(0);
+                        nanos % (jitter_ms + 1)
+                    } else {
+                        0
+                    };
+                    tokio::time::sleep(Duration::from_millis(interval_ms + jitter)).await;
+                }
             }
         }
     }
@@ -272,7 +778,26 @@ pub(super) async fn run_online_probes(cfg: &Config, cache: &mut StatusCache) {
 
 /// 对单个 model/protocol/provider 绑定执行一次真实探活，结果写入 cache。
 /// 同时被 CLI 独立模式（`status --probe`）与 Server 委托（`/admin/status/probe`）复用。
+///
+/// # Probe send governance
+///
+/// `cooldown_store` enables two governance checks that align the probe path
+/// with the forwarding path:
+/// 1. **Pre-send cooldown check**: if the (provider, model) is already in
+///    cooldown, skip the upstream request and report COOLDOWN status.
+/// 2. **Post-response cooldown writeback**: on 429 / 5xx, write a cooldown
+///    entry so the isolation window is extended.
+///
+/// Both are no-ops when `cooldown_store` is `None` (backward compatibility
+/// for callers that don't have access to the cooldown store).
+///
+/// ## frequency accounting
+/// The single send point below (marked `frequency accounting hook`)
+/// is the instrumentable location where shared rate-limit group accounting
+/// will be plugged in later.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_one_online_probe(
+    config_path: &Path,
     cfg: &Config,
     cache: &mut StatusCache,
     client: &reqwest::Client,
@@ -280,7 +805,9 @@ pub(crate) async fn run_one_online_probe(
     protocol: Protocol,
     provider_id: &str,
     plan: &crate::config::ExecutionPlan,
-) {
+    cooldown_store: Option<&crate::cooldown::CooldownStore>,
+    cooldown_cfg: &crate::config::FallbackCooldownConfig,
+) -> bool {
     let key = super::format::probe_key(model_id, provider_id, protocol);
     let now = unix_now();
     let mut entry = ProbeCacheEntry {
@@ -291,7 +818,31 @@ pub(crate) async fn run_one_online_probe(
         error: None,
     };
 
-    let resolved_auth = match cfg.resolve_auth(provider_id) {
+    // 判据 1: pre-send cooldown check.
+    // If the forwarding path has already placed this (provider, model) in
+    // cooldown, the probe must not send upstream — report COOLDOWN instead.
+    let cooldown_key = plan.cooldown_key(model_id);
+    if let Some(store) = cooldown_store
+        && store.is_cooling_down(&cooldown_key)
+    {
+        let remaining = store
+            .active_entry(&cooldown_key)
+            .map(|e| e.expires_at_unix.saturating_sub(now))
+            .unwrap_or(0);
+        entry.error = Some(format!(
+            "probe skipped: provider in cooldown ({remaining}s remaining)"
+        ));
+        println!(
+            "  {} {model_id} {} {provider_id}  probe skipped (cooldown, {remaining}s remaining)",
+            badge("SKIP"),
+            protocol_label(protocol.route_key())
+        );
+        cache.probes.insert(key, entry);
+        return false;
+    }
+
+    let accounts_path = crate::auth::state_path_for_config(config_path);
+    let resolved_auth = match cfg.resolve_auth_at(provider_id, &accounts_path) {
         Ok(auth) => auth,
         Err(err) => {
             entry.error = Some(format!("auth unavailable: {err}"));
@@ -300,7 +851,7 @@ pub(crate) async fn run_one_online_probe(
                 protocol_label(protocol.route_key())
             );
             cache.probes.insert(key, entry);
-            return;
+            return false;
         }
     };
 
@@ -313,15 +864,20 @@ pub(crate) async fn run_one_online_probe(
                 protocol_label(protocol.route_key())
             );
             cache.probes.insert(key, entry);
-            return;
+            return false;
         }
     };
 
     let started = Instant::now();
+    // frequency accounting hook — all probe sends go through this
+    // call site. Shared rate-limit group accounting plugs in here.
     let request = crate::probe::apply_auth_header(
         plan,
-        crate::probe::apply_protocol_headers(plan, client.post(&plan.native_url).json(&body)),
-        resolved_auth.token,
+        crate::probe::apply_protocol_headers(
+            plan,
+            client.post(plan.native_url.clone()).json(&body),
+        ),
+        resolved_auth.token.clone(),
     );
     let result = request.send().await;
     entry.latency_ms = Some(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
@@ -366,6 +922,57 @@ pub(crate) async fn run_one_online_probe(
                     badge("FAIL"),
                     protocol_label(protocol.route_key())
                 );
+
+                // 判据 2: post-response cooldown writeback.
+                // Match the forwarding path's governance: 429 and health-family
+                // 5xx write a cooldown so the isolation window is extended.
+                if let Some(store) = cooldown_store
+                    && let Some(duration) = probe_cooldown_duration_for_status(status, cooldown_cfg)
+                {
+                    let kind = probe_cooldown_kind_for_status(status);
+                    store.set(&cooldown_key, kind, &format!("probe {status}"), duration);
+                }
+
+                // upstream 400 → per-provider abnormal request counter.
+                // When count reaches tolerance → provider-level cooldown.
+                // Local 400 (from llm-proxy pre-check) never reaches here because
+                // probes always send to upstream; local 400 only occurs in the
+                // forwarding path (handled by ).
+                if status == StatusCode::BAD_REQUEST
+                    && let Some(store) = cooldown_store
+                {
+                    let count = store.increment_bad_request_count(provider_id);
+                    let tolerance = cfg
+                        .providers
+                        .get(provider_id)
+                        .map(|p| p.bad_request_tolerance)
+                        .unwrap_or(2);
+                    if count >= tolerance {
+                        let duration = Duration::from_secs(
+                            cooldown_cfg.client_error_seconds.min(24 * 60 * 60),
+                        );
+                        // Provider-level cooldown: write for all client protocols
+                        // with wildcard model_id so all models under this provider
+                        // are affected.
+                        for proto in Protocol::CLIENT_PROTOCOLS {
+                            let provider_key = crate::config::CooldownKey {
+                                model_id: "*".to_string(),
+                                provider_id: provider_id.to_string(),
+                                protocol: proto,
+                                token: None,
+                                token_key_hash: None,
+                            };
+                            store.set(
+                                &provider_key,
+                                "bad_request_tolerance",
+                                &format!("probe 400 tolerance reached ({count}/{tolerance})"),
+                                duration,
+                            );
+                        }
+                        // Reset counter after triggering cooldown
+                        store.reset_bad_request_count(provider_id);
+                    }
+                }
             }
         }
         Err(err) => {
@@ -378,13 +985,51 @@ pub(crate) async fn run_one_online_probe(
         }
     }
     cache.probes.insert(key, entry);
+    true
 }
 
-async fn discover_dynamic_models(cfg: &Config, cache: &mut StatusCache) {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-    {
+/// Cooldown duration for probe responses — mirrors the forwarding path's
+/// `cooldown_duration_for_status` but only for the health-family statuses
+/// that probes should trigger cooldown on (429, 5xx). Probes do NOT write
+/// cooldown for 400/401/403/402/404/408 — those are request-level errors
+/// that don't indicate provider health issues.
+fn probe_cooldown_duration_for_status(
+    status: StatusCode,
+    cooldown_cfg: &crate::config::FallbackCooldownConfig,
+) -> Option<Duration> {
+    let seconds = if status == StatusCode::TOO_MANY_REQUESTS {
+        cooldown_cfg.rate_limit_seconds
+    } else if status.is_server_error() {
+        cooldown_cfg.server_error_seconds
+    } else {
+        0
+    };
+    if seconds == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(seconds.min(24 * 60 * 60)))
+    }
+}
+
+/// Cooldown kind for probe responses — subset of the forwarding path's
+/// `cooldown_kind_for_status`, covering only the statuses probes write back.
+fn probe_cooldown_kind_for_status(status: StatusCode) -> &'static str {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        "rate_limit"
+    } else if status.is_server_error() {
+        "server_error"
+    } else {
+        "unknown"
+    }
+}
+
+pub(crate) async fn discover_dynamic_models(
+    cfg: &Config,
+    cache: &mut StatusCache,
+    selection: &ProbeSelection,
+    oauth_accounts_path: &Path,
+) {
+    let client = match crate::http_client::try_build_with_timeout(cfg, Duration::from_secs(30)) {
         Ok(client) => client,
         Err(err) => {
             println!("  dynamic model discovery client init failed: {err}");
@@ -392,17 +1037,31 @@ async fn discover_dynamic_models(cfg: &Config, cache: &mut StatusCache) {
         }
     };
 
+    let target_providers: Option<HashSet<String>> = if selection.is_empty() {
+        None
+    } else {
+        let candidates = selection.candidates(cfg);
+        Some(
+            candidates
+                .into_iter()
+                .map(|(provider_id, _, _)| provider_id)
+                .collect(),
+        )
+    };
+
     for (provider_id, provider) in &cfg.providers {
-        let result = if provider.antigravity.is_some() {
-            discover_antigravity_models(&client, provider_id, provider, cfg).await
-        } else {
-            match provider_id.as_str() {
-                "ollama" => discover_ollama_models(&client, provider_id, provider).await,
-                "openrouter" => {
-                    discover_openrouter_models(&client, provider_id, provider, cfg).await
-                }
-                _ => continue,
+        if let Some(ref targets) = target_providers
+            && !targets.contains(provider_id)
+        {
+            continue;
+        }
+        let result = match provider_id.as_str() {
+            "ollama" => discover_ollama_models(&client, provider_id, provider).await,
+            "openrouter" => {
+                discover_openrouter_models(&client, provider_id, provider, cfg, oauth_accounts_path)
+                    .await
             }
+            _ => continue,
         };
         match result {
             Ok(rows) => {
@@ -502,7 +1161,7 @@ pub(super) fn ollama_cache_row(
         max_output_tokens: None,
         features,
         supported_parameters: Vec::new(),
-        supported_reasoning_levels: Vec::new(),
+        reasoning_levels: None,
         default_reasoning_level: None,
     }
 }
@@ -545,14 +1204,16 @@ async fn discover_openrouter_models(
     provider_id: &str,
     provider: &crate::config::ProviderConfig,
     cfg: &Config,
+    oauth_accounts_path: &Path,
 ) -> Result<Vec<super::cache::DynamicModelCacheEntry>> {
     let source_url = "https://openrouter.ai/api/v1/models".to_string();
     let mut req = client.get(&source_url);
-    match cfg.auth_token(provider_id) {
-        Ok(Some(token)) => {
-            req = req.bearer_auth(token);
+    match cfg.resolve_auth_at(provider_id, oauth_accounts_path) {
+        Ok(auth) => {
+            if let Some(token) = auth.token {
+                req = req.bearer_auth(token);
+            }
         }
-        Ok(None) => {}
         Err(_) if provider.api_key_env.is_some() => {
             // OpenRouter model list can be public, so absence of a key should not
             // prevent explicit discovery. Authenticated accounts may see richer data.
@@ -597,116 +1258,6 @@ async fn discover_openrouter_models(
     Ok(rows)
 }
 
-async fn discover_antigravity_models(
-    client: &reqwest::Client,
-    provider_id: &str,
-    provider: &crate::config::ProviderConfig,
-    cfg: &Config,
-) -> Result<Vec<super::cache::DynamicModelCacheEntry>> {
-    let auth = cfg.resolve_auth(provider_id)?;
-    let token = auth
-        .token
-        .context("Antigravity model discovery requires OAuth access token")?;
-    let base = antigravity_base_url(provider)
-        .unwrap_or_else(|| "https://cloudcode-pa.googleapis.com".to_string());
-    let source_url = format!(
-        "{}/v1internal:fetchAvailableModels",
-        base.trim_end_matches('/')
-    );
-    let mut body = serde_json::Map::new();
-    if let Some(project_id) = auth.project_id.filter(|id| !id.is_empty()) {
-        body.insert("project".to_string(), serde_json::json!(project_id));
-    }
-    let payload: serde_json::Value = client
-        .post(&source_url)
-        .bearer_auth(token)
-        .header("User-Agent", "antigravity/cli/1.0.13")
-        .json(&serde_json::Value::Object(body))
-        .send()
-        .await
-        .context("POST Antigravity fetchAvailableModels failed")?
-        .error_for_status()
-        .context("POST Antigravity fetchAvailableModels returned error")?
-        .json()
-        .await
-        .context("POST Antigravity fetchAvailableModels returned invalid JSON")?;
-    Ok(antigravity_cache_rows(
-        provider_id,
-        &source_url,
-        unix_now(),
-        &payload,
-    ))
-}
-
-pub(super) fn antigravity_cache_rows(
-    provider_id: &str,
-    source_url: &str,
-    now: u64,
-    payload: &serde_json::Value,
-) -> Vec<super::cache::DynamicModelCacheEntry> {
-    let web_search = string_array(payload.get("webSearchModelIds"))
-        .into_iter()
-        .map(|id| id.to_lowercase())
-        .collect::<std::collections::BTreeSet<_>>();
-    payload
-        .get("models")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|item| antigravity_model_id(item).map(|id| (id, item)))
-        .map(|(id, item)| {
-            let mut features = Vec::new();
-            if web_search.contains(&id.to_lowercase()) {
-                features.push("web_search".to_string());
-            }
-            super::cache::DynamicModelCacheEntry {
-                provider_id: provider_id.to_string(),
-                source_url: source_url.to_string(),
-                probed_at_unix: now,
-                stale_after_unix: now + 24 * 60 * 60,
-                model_id: id.clone(),
-                display_name: item
-                    .get("displayName")
-                    .or_else(|| item.get("display_name"))
-                    .or_else(|| item.get("name"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToString::to_string)
-                    .or(Some(id)),
-                context_window: item
-                    .get("contextWindow")
-                    .or_else(|| item.get("context_window"))
-                    .and_then(serde_json::Value::as_i64),
-                max_output_tokens: item
-                    .get("maxOutputTokens")
-                    .or_else(|| item.get("max_output_tokens"))
-                    .and_then(serde_json::Value::as_i64),
-                features,
-                supported_parameters: Vec::new(),
-                supported_reasoning_levels: Vec::new(),
-                default_reasoning_level: None,
-            }
-        })
-        .collect()
-}
-
-pub(super) fn antigravity_model_id(item: &serde_json::Value) -> Option<String> {
-    if let Some(id) = item.as_str() {
-        return Some(id.to_string());
-    }
-    item.get("id")
-        .or_else(|| item.get("model"))
-        .or_else(|| item.get("name"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|id| !id.is_empty())
-        .map(ToString::to_string)
-}
-
-fn antigravity_base_url(provider: &crate::config::ProviderConfig) -> Option<String> {
-    let url = provider.antigravity.as_ref()?.url.as_ref()?;
-    let parsed = url::Url::parse(url).ok()?;
-    Some(parsed.origin().ascii_serialization())
-}
-
 pub(super) fn openrouter_cache_row(
     provider_id: &str,
     source_url: &str,
@@ -742,9 +1293,9 @@ pub(super) fn openrouter_cache_row(
         }
     }
     let reasoning = item.get("reasoning");
-    let supported_reasoning_levels = {
+    let reasoning_levels = {
         let explicit = string_array(reasoning.and_then(|r| r.get("supported_efforts")));
-        if !explicit.is_empty() {
+        let levels: Vec<String> = if !explicit.is_empty() {
             explicit
         } else {
             if supported_parameters
@@ -762,6 +1313,16 @@ pub(super) fn openrouter_cache_row(
             } else {
                 Vec::new()
             }
+        };
+        if levels.is_empty() {
+            None
+        } else {
+            Some(
+                levels
+                    .into_iter()
+                    .map(|level| ReasoningLevelEntry::new(level, None))
+                    .collect(),
+            )
         }
     };
     let default_reasoning_level = reasoning
@@ -782,7 +1343,7 @@ pub(super) fn openrouter_cache_row(
         max_output_tokens,
         features: features.into_iter().collect(),
         supported_parameters,
-        supported_reasoning_levels,
+        reasoning_levels,
         default_reasoning_level,
     }
 }

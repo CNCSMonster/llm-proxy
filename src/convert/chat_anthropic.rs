@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
 
 use super::shared::*;
@@ -12,7 +12,9 @@ pub fn chat_to_anthropic_request(mut req: Value, upstream_model: &str) -> Result
     copy_field(obj, &mut out, "stream", "stream");
     copy_field(obj, &mut out, "temperature", "temperature");
     copy_field(obj, &mut out, "top_p", "top_p");
-    copy_field(obj, &mut out, "max_tokens", "max_tokens");
+    if let Some(value) = chat_max_tokens(obj) {
+        out.insert("max_tokens".to_string(), value.clone());
+    }
     copy_field(obj, &mut out, "stop", "stop_sequences");
 
     let mut messages = Vec::new();
@@ -32,7 +34,13 @@ pub fn chat_to_anthropic_request(mut req: Value, upstream_model: &str) -> Result
         if role == "system" {
             let text = anthropic_content_to_text(msg_obj.get("content"));
             if !text.is_empty() {
-                out.insert("system".to_string(), json!(text));
+                let existing = out.get("system").and_then(Value::as_str).unwrap_or("");
+                let merged = if existing.is_empty() {
+                    text
+                } else {
+                    format!("{existing}\n{text}")
+                };
+                out.insert("system".to_string(), json!(merged));
             }
             continue;
         }
@@ -49,7 +57,7 @@ pub fn chat_to_anthropic_request(mut req: Value, upstream_model: &str) -> Result
         }
         messages.push(json!({
             "role": if role == "assistant" { "assistant" } else { "user" },
-            "content": chat_message_content_to_anthropic(msg_obj)
+            "content": chat_message_content_to_anthropic(msg_obj)?
         }));
     }
     out.insert("messages".to_string(), Value::Array(messages));
@@ -66,6 +74,15 @@ pub fn chat_to_anthropic_request(mut req: Value, upstream_model: &str) -> Result
             chat_tool_choice_to_anthropic(choice),
         );
     }
+    // Convert Chat reasoning_effort → Anthropic 4.6+ thinking + output_config.
+    if let Some(effort) = obj.get("reasoning_effort").and_then(Value::as_str) {
+        if effort == "none" {
+            out.insert("thinking".to_string(), json!({"type": "disabled"}));
+        } else {
+            out.insert("thinking".to_string(), json!({"type": "adaptive"}));
+            out.insert("output_config".to_string(), json!({"effort": effort}));
+        }
+    }
     Ok(Value::Object(out))
 }
 
@@ -73,7 +90,8 @@ pub fn anthropic_to_chat_response(resp: Value, frontend_model: &str) -> Value {
     let id = resp
         .get("id")
         .and_then(Value::as_str)
-        .unwrap_or("chatcmpl_llm_proxy");
+        .map(str::to_string)
+        .unwrap_or_else(|| new_scoped_id("chatcmpl-"));
     let mut content_text = String::new();
     let mut tool_calls = Vec::new();
     for part in resp
@@ -113,7 +131,7 @@ pub fn anthropic_to_chat_response(resp: Value, frontend_model: &str) -> Value {
     json!({
         "id": id,
         "object": "chat.completion",
-        "created": 0,
+        "created": unix_now_secs(),
         "model": frontend_model,
         "choices": [{
             "index": 0,
@@ -128,6 +146,8 @@ pub fn anthropic_to_chat(mut req: Value, upstream_model: &str) -> Result<Value> 
     let obj = req
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("Anthropic request must be a JSON object"))?;
+    validate_anthropic_message_images(obj.get("messages"))?;
+    validate_anthropic_message_documents_for_chat(obj.get("messages"))?;
 
     let mut out = Map::new();
     out.insert("model".to_string(), json!(upstream_model));
@@ -154,10 +174,10 @@ pub fn anthropic_to_chat(mut req: Value, upstream_model: &str) -> Result<Value> 
             let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
             match role {
                 "assistant" => messages.push(anthropic_assistant_to_chat(msg)),
-                "user" => append_anthropic_user_to_chat(msg, &mut messages),
+                "user" => append_anthropic_user_to_chat(msg, &mut messages)?,
                 other => messages.push(json!({
                     "role": other,
-                    "content": anthropic_content_to_chat(msg.get("content"))
+                    "content": anthropic_content_to_chat(msg.get("content"))?
                 })),
             }
         }
@@ -184,14 +204,43 @@ pub fn anthropic_to_chat(mut req: Value, upstream_model: &str) -> Result<Value> 
         );
     }
 
+    // Convert Anthropic 4.6+ thinking + output_config → Chat reasoning_effort.
+    // adaptive + effort=E → reasoning_effort = "E"
+    // disabled → reasoning_effort = "none"
+    // disabled + effort=E → reasoning_effort = "none" (degraded: drop effort)
+    // only output_config.effort=E (no thinking) → reasoning_effort = "E"
+    let thinking_type = obj
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(Value::as_str);
+    let effort = obj
+        .get("output_config")
+        .and_then(|oc| oc.get("effort"))
+        .and_then(Value::as_str);
+    match thinking_type {
+        Some("disabled") => {
+            out.insert("reasoning_effort".to_string(), json!("none"));
+        }
+        Some("adaptive") | None => {
+            if let Some(effort) = effort {
+                out.insert("reasoning_effort".to_string(), json!(effort));
+            }
+        }
+        _ => {}
+    }
+
     Ok(Value::Object(out))
 }
 
 pub fn chat_to_anthropic(resp: Value, frontend_model: &str) -> Value {
+    // Anthropic message ids must stay in the `msg_` namespace (spec.md §6,
+    // P7): a Chat `chatcmpl…` id is never surfaced verbatim.
     let id = resp
         .get("id")
         .and_then(Value::as_str)
-        .unwrap_or("msg_llm_proxy");
+        .filter(|id| id.starts_with("msg_"))
+        .map(str::to_string)
+        .unwrap_or_else(|| new_scoped_id("msg_"));
     let choice = resp
         .get("choices")
         .and_then(Value::as_array)
@@ -242,7 +291,10 @@ pub fn chat_to_anthropic(resp: Value, frontend_model: &str) -> Value {
     })
 }
 
-fn append_anthropic_user_to_chat(msg: &Map<String, Value>, messages: &mut Vec<Value>) {
+fn append_anthropic_user_to_chat(
+    msg: &Map<String, Value>,
+    messages: &mut Vec<Value>,
+) -> Result<()> {
     let content = msg.get("content");
     if let Some(parts) = content.and_then(Value::as_array) {
         let mut normal_parts = Vec::new();
@@ -263,7 +315,7 @@ fn append_anthropic_user_to_chat(msg: &Map<String, Value>, messages: &mut Vec<Va
                         "content": anthropic_content_to_text(obj.get("content"))
                     }));
                 }
-                _ => normal_parts.push(anthropic_block_to_chat_content(part)),
+                _ => normal_parts.push(anthropic_block_to_chat_content(part)?),
             }
         }
         if !normal_parts.is_empty() {
@@ -280,8 +332,9 @@ fn append_anthropic_user_to_chat(msg: &Map<String, Value>, messages: &mut Vec<Va
             messages.push(json!({ "role": "user", "content": content }));
         }
     } else {
-        messages.push(json!({ "role": "user", "content": anthropic_content_to_chat(content) }));
+        messages.push(json!({ "role": "user", "content": anthropic_content_to_chat(content)? }));
     }
+    Ok(())
 }
 
 fn anthropic_assistant_to_chat(msg: &Map<String, Value>) -> Value {
@@ -298,13 +351,36 @@ fn anthropic_assistant_to_chat(msg: &Map<String, Value>) -> Value {
                         text_parts.push(text.to_string());
                     }
                 }
+                // Track 2: preserve plaintext thinking so third-party
+                // models retain the reasoning context from prior turns.
+                "thinking" => {
+                    if let Some(text) = obj.get("thinking").and_then(Value::as_str)
+                        && !text.is_empty()
+                    {
+                        text_parts.push(text.to_string());
+                    }
+                }
+                // Track 2: redacted_thinking carries Anthropic-encrypted
+                // signatures that third-party models cannot verify.  Strip the
+                // signature and emit a neutral placeholder so the "thinking before
+                // tool_use" structural constraint is maintained without poisoning
+                // the upstream with an invalid signature.
+                "redacted_thinking" => {}
                 "tool_use" => {
                     let id = obj
                         .get("id")
                         .and_then(Value::as_str)
                         .unwrap_or("call_unknown");
                     let name = obj.get("name").and_then(Value::as_str).unwrap_or("unknown");
+                    // Track 2: normalise empty-string arguments to `{}`
+                    // because strict third-party endpoints reject `""`.
                     let input = obj.get("input").cloned().unwrap_or_else(|| json!({}));
+                    let input = if input.is_string() && input.as_str().is_some_and(|s| s.is_empty())
+                    {
+                        json!({})
+                    } else {
+                        input
+                    };
                     tool_calls.push(json!({
                         "id": id,
                         "type": "function",
@@ -326,32 +402,35 @@ fn anthropic_assistant_to_chat(msg: &Map<String, Value>) -> Value {
     Value::Object(out)
 }
 
-fn anthropic_content_to_chat(content: Option<&Value>) -> Value {
+fn anthropic_content_to_chat(content: Option<&Value>) -> Result<Value> {
     match content {
-        Some(Value::String(text)) => json!(text),
-        Some(Value::Array(parts)) => {
-            Value::Array(parts.iter().map(anthropic_block_to_chat_content).collect())
-        }
-        _ => json!(""),
+        Some(Value::String(text)) => Ok(json!(text)),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .map(anthropic_block_to_chat_content)
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array),
+        _ => Ok(json!("")),
     }
 }
 
-pub(super) fn anthropic_block_to_chat_content(part: &Value) -> Value {
-    let Some(obj) = part.as_object() else {
-        return json!({ "type": "text", "text": "" });
-    };
+pub(super) fn anthropic_block_to_chat_content(part: &Value) -> Result<Value> {
+    let obj = part
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Anthropic content block must be an object"))?;
     match obj.get("type").and_then(Value::as_str).unwrap_or("") {
-        "text" => {
-            json!({ "type": "text", "text": obj.get("text").and_then(Value::as_str).unwrap_or("") })
-        }
-        "image" => json!({
+        "text" => Ok(json!({
+            "type": "text",
+            "text": obj.get("text").and_then(Value::as_str).unwrap_or("")
+        })),
+        "image" => Ok(json!({
             "type": "image_url",
             "image_url": {
-                "url": anthropic_source_to_openai_url(obj.get("source").and_then(Value::as_object), "image/png")
+                "url": strict_anthropic_image_source_to_openai_url(obj.get("source").and_then(Value::as_object))?
             }
-        }),
-        "document" => json!({ "type": "file", "file": anthropic_document_to_responses_file(part) }),
-        _ => json!({ "type": "text", "text": anthropic_content_to_text(Some(part)) }),
+        })),
+        "document" => bail!("Anthropic document content is unsupported for Chat Completions"),
+        other => bail!("unsupported Anthropic content block type for Chat Completions: {other}"),
     }
 }
 

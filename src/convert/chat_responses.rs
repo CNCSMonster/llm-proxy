@@ -3,7 +3,28 @@ use serde_json::{Map, Value, json};
 
 use super::shared::*;
 
-pub fn responses_to_chat(mut req: Value, upstream_model: &str) -> Result<Value> {
+/// Convert Responses API request to Chat Completions format.
+///
+/// Note: `previous_response_id` is silently dropped (ADR-036).
+/// This field requires `store=true` to work, but llm-proxy defaults to `store=false`.
+/// Clients (Codex, OpenAI SDK) don't send this field by default.
+///
+/// Default behavior: strict rejection (placeholder_enabled=false).
+pub fn responses_to_chat(req: Value, upstream_model: &str) -> Result<Value> {
+    let (value, _events) = responses_to_chat_with_placeholder(req, upstream_model, false, false)?;
+    Ok(value)
+}
+
+/// Convert Responses API request to Chat Completions format with
+/// placeholder opt-in and reasoning requirement.
+/// Returns the converted value and any placeholder events
+/// that were generated (for diagnostics recording).
+pub fn responses_to_chat_with_placeholder(
+    mut req: Value,
+    upstream_model: &str,
+    placeholder_enabled: bool,
+    requires_reasoning: bool,
+) -> Result<(Value, Vec<PlaceholderEvent>)> {
     let obj = req
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("Responses request must be a JSON object"))?;
@@ -25,6 +46,7 @@ pub fn responses_to_chat(mut req: Value, upstream_model: &str) -> Result<Value> 
     }
 
     let mut messages = Vec::new();
+    let mut events = Vec::new();
     if let Some(instructions) = obj.get("instructions").and_then(Value::as_str)
         && !instructions.is_empty()
     {
@@ -36,7 +58,12 @@ pub fn responses_to_chat(mut req: Value, upstream_model: &str) -> Result<Value> 
             messages.push(json!({ "role": "user", "content": text }));
         }
         Some(Value::Array(items)) => {
-            append_responses_items_as_chat_messages(items, &mut messages)?;
+            events = append_responses_items_as_chat_messages(
+                items,
+                &mut messages,
+                placeholder_enabled,
+                requires_reasoning,
+            )?;
         }
         Some(other) => bail!("unsupported Responses input shape: {other}"),
         None => {}
@@ -57,7 +84,7 @@ pub fn responses_to_chat(mut req: Value, upstream_model: &str) -> Result<Value> 
         );
     }
 
-    Ok(Value::Object(out))
+    Ok((Value::Object(out), events))
 }
 
 pub fn chat_to_responses_request(mut req: Value, upstream_model: &str) -> Result<Value> {
@@ -70,7 +97,9 @@ pub fn chat_to_responses_request(mut req: Value, upstream_model: &str) -> Result
     copy_field(obj, &mut out, "stream", "stream");
     copy_field(obj, &mut out, "temperature", "temperature");
     copy_field(obj, &mut out, "top_p", "top_p");
-    copy_field(obj, &mut out, "max_tokens", "max_output_tokens");
+    if let Some(value) = chat_max_tokens(obj) {
+        out.insert("max_output_tokens".to_string(), value.clone());
+    }
     copy_field(obj, &mut out, "parallel_tool_calls", "parallel_tool_calls");
     copy_field(obj, &mut out, "tool_choice", "tool_choice");
 
@@ -115,7 +144,7 @@ pub fn chat_to_responses_request(mut req: Value, upstream_model: &str) -> Result
         input.push(json!({
             "type": "message",
             "role": if role == "assistant" { "assistant" } else { "user" },
-            "content": chat_content_to_responses_content(msg_obj.get("content"), role)
+            "content": chat_content_to_responses_content(msg_obj.get("content"), role)?
         }));
         if role == "assistant"
             && let Some(tool_calls) = msg_obj.get("tool_calls").and_then(Value::as_array)
@@ -161,8 +190,12 @@ pub fn responses_to_chat_response(resp: Value, frontend_model: &str) -> Value {
     let id = resp
         .get("id")
         .and_then(Value::as_str)
-        .unwrap_or("chatcmpl_llm_proxy");
-    let created = resp.get("created_at").and_then(Value::as_i64).unwrap_or(0);
+        .map(str::to_string)
+        .unwrap_or_else(|| new_scoped_id("chatcmpl-"));
+    let created = resp
+        .get("created_at")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(unix_now_secs);
     let mut content = String::new();
     let mut tool_calls = Vec::new();
     for item in resp
@@ -226,40 +259,52 @@ pub fn responses_to_chat_response(resp: Value, frontend_model: &str) -> Value {
     })
 }
 
-fn chat_content_to_responses_content(content: Option<&Value>, role: &str) -> Value {
+fn chat_content_to_responses_content(content: Option<&Value>, role: &str) -> Result<Value> {
     let text_type = if role == "assistant" {
         "output_text"
     } else {
         "input_text"
     };
     match content {
-        Some(Value::String(text)) => json!([{ "type": text_type, "text": text }]),
-        Some(Value::Array(parts)) => Value::Array(
+        Some(Value::String(text)) => Ok(json!([{ "type": text_type, "text": text }])),
+        Some(Value::Array(parts)) => Ok(Value::Array(
             parts
                 .iter()
                 .map(|part| chat_part_to_responses_part(part, text_type))
-                .collect(),
-        ),
-        Some(other) => json!([{ "type": text_type, "text": other.to_string() }]),
-        None => json!([]),
+                .collect::<Result<Vec<_>>>()?,
+        )),
+        Some(other) => Ok(json!([{ "type": text_type, "text": other.to_string() }])),
+        None => Ok(json!([])),
     }
 }
 
-fn chat_part_to_responses_part(part: &Value, text_type: &str) -> Value {
+fn chat_part_to_responses_part(part: &Value, text_type: &str) -> Result<Value> {
     let Some(obj) = part.as_object() else {
-        return json!({ "type": text_type, "text": part.to_string() });
+        return Ok(json!({ "type": text_type, "text": part.to_string() }));
     };
     match obj.get("type").and_then(Value::as_str).unwrap_or("") {
-        "text" => {
-            json!({ "type": text_type, "text": obj.get("text").and_then(Value::as_str).unwrap_or("") })
-        }
+        "text" => Ok(
+            json!({ "type": text_type, "text": obj.get("text").and_then(Value::as_str).unwrap_or("") }),
+        ),
         "image_url" => {
-            json!({ "type": "input_image", "image_url": obj.get("image_url").cloned().unwrap_or_else(|| json!({})) })
+            let image = obj.get("image_url").and_then(Value::as_object);
+            let image_url = image
+                .and_then(|image| image.get("url"))
+                .and_then(Value::as_str)
+                .filter(|url| !url.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Chat image_url.url must be a non-empty string"))?;
+            let mut output = Map::new();
+            output.insert("type".to_string(), json!("input_image"));
+            output.insert("image_url".to_string(), json!(image_url));
+            if let Some(detail) = image.and_then(|image| image.get("detail")) {
+                output.insert("detail".to_string(), detail.clone());
+            }
+            Ok(Value::Object(output))
         }
         other => {
             let mut out = obj.clone();
             out.insert("type".to_string(), json!(other));
-            Value::Object(out)
+            Ok(Value::Object(out))
         }
     }
 }
@@ -290,28 +335,165 @@ fn chat_usage_from_responses(usage: Option<&Value>) -> Value {
     })
 }
 
+#[cfg(test)]
 pub fn chat_to_responses(resp: Value, frontend_model: &str) -> Value {
+    chat_to_responses_with_context(resp, frontend_model, None)
+}
+
+fn failed_response(
+    id: &str,
+    created: i64,
+    frontend_model: &str,
+    message: &str,
+    request_context: Option<&Value>,
+) -> Value {
+    let mut resp_obj = Map::new();
+    resp_obj.insert("id".to_string(), json!(id));
+    resp_obj.insert("object".to_string(), json!("response"));
+    resp_obj.insert("created_at".to_string(), json!(created));
+    resp_obj.insert("status".to_string(), json!("failed"));
+    resp_obj.insert("incomplete_details".to_string(), Value::Null);
+    resp_obj.insert("model".to_string(), json!(frontend_model));
+    resp_obj.insert("output".to_string(), json!([]));
+    resp_obj.insert(
+        "error".to_string(),
+        json!({
+            "code": "server_error",
+            "message": message
+        }),
+    );
+    apply_request_context_defaults(&mut resp_obj, request_context);
+    Value::Object(resp_obj)
+}
+
+pub fn chat_to_responses_with_context(
+    resp: Value,
+    frontend_model: &str,
+    request_context: Option<&Value>,
+) -> Value {
     let id = resp
         .get("id")
         .and_then(Value::as_str)
-        .unwrap_or("resp_llm_proxy");
-    let created = resp.get("created").and_then(Value::as_i64).unwrap_or(0);
-    let choice = resp
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
+        .map(str::to_string)
+        .unwrap_or_else(|| new_scoped_id("resp_"));
+    let id: &str = &id;
+    let created = resp
+        .get("created")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(unix_now_secs);
+
+    if let Some(err) = resp.get("error")
+        && (!err.is_null() && err != &json!({}))
+    {
+        return failed_response(
+            id,
+            created,
+            frontend_model,
+            "Upstream service error",
+            request_context,
+        );
+    }
+
+    let choices = match resp.get("choices").and_then(Value::as_array) {
+        Some(c) if !c.is_empty() => c,
+        _ => {
+            return failed_response(
+                id,
+                created,
+                frontend_model,
+                "Missing choices in upstream response",
+                request_context,
+            );
+        }
+    };
+
+    let choice = match choices[0].as_object() {
+        Some(obj) => obj,
+        None => {
+            return failed_response(
+                id,
+                created,
+                frontend_model,
+                "Malformed choice in upstream response",
+                request_context,
+            );
+        }
+    };
+
+    let message = match choice.get("message").and_then(Value::as_object) {
+        Some(m) => m,
+        None => {
+            return failed_response(
+                id,
+                created,
+                frontend_model,
+                "Malformed message in upstream response",
+                request_context,
+            );
+        }
+    };
+
+    let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
+
+    let valid_finish = matches!(
+        finish_reason,
+        Some("stop") | Some("tool_calls") | Some("length") | Some("content_filter")
+    );
+
+    if !valid_finish {
+        return failed_response(
+            id,
+            created,
+            frontend_model,
+            "Missing or invalid finish reason from upstream",
+            request_context,
+        );
+    }
+    let finish_reason = finish_reason.unwrap();
+    let is_truncated = finish_reason == "length" || finish_reason == "content_filter";
+    let item_status = if is_truncated {
+        "incomplete"
+    } else {
+        "completed"
+    };
 
     let mut output = Vec::new();
+
+    if let Some(reasoning_val) = message.get("reasoning_content")
+        && !reasoning_val.is_null()
+    {
+        let Some(reasoning) = reasoning_val.as_str() else {
+            return failed_response(
+                id,
+                created,
+                frontend_model,
+                "Malformed reasoning_content in upstream response",
+                request_context,
+            );
+        };
+        if !reasoning.is_empty() {
+            let rs_id = format!("rs_{}", uuid::Uuid::new_v4().as_simple());
+            output.push(json!({
+                "id": rs_id,
+                "type": "reasoning",
+                "status": item_status,
+                "content": [{
+                    "type": "reasoning_text",
+                    "text": reasoning
+                }],
+                "summary": []
+            }));
+        }
+    }
+
     let text = extract_chat_content_text(message.get("content"));
     if !text.is_empty() {
+        let msg_id = format!("msg_{}", uuid::Uuid::new_v4().as_simple());
         output.push(json!({
-            "id": format!("msg_{created}"),
+            "id": msg_id,
             "type": "message",
             "role": "assistant",
-            "status": "completed",
+            "status": item_status,
             "content": [{
                 "type": "output_text",
                 "text": text,
@@ -320,39 +502,288 @@ pub fn chat_to_responses(resp: Value, frontend_model: &str) -> Value {
         }));
     }
 
-    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+    if let Some(tool_calls_val) = message.get("tool_calls") {
+        let tool_calls = match tool_calls_val.as_array() {
+            Some(arr) => arr,
+            None => {
+                return failed_response(
+                    id,
+                    created,
+                    frontend_model,
+                    "Malformed tool_calls array in upstream response",
+                    request_context,
+                );
+            }
+        };
+
+        let mut seen_call_ids = std::collections::HashSet::new();
         for call in tool_calls {
-            let id = call
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("call_unknown");
-            let function = call.get("function").and_then(Value::as_object);
-            let name = function
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let arguments = function
-                .and_then(|f| f.get("arguments"))
-                .and_then(Value::as_str)
-                .unwrap_or("{}");
+            let Some(call_obj) = call.as_object() else {
+                return failed_response(
+                    id,
+                    created,
+                    frontend_model,
+                    "Malformed tool call object in upstream response",
+                    request_context,
+                );
+            };
+
+            let Some(call_id) = call_obj.get("id").and_then(Value::as_str) else {
+                return failed_response(
+                    id,
+                    created,
+                    frontend_model,
+                    "Tool call missing id in upstream response",
+                    request_context,
+                );
+            };
+            if call_id.is_empty() {
+                return failed_response(
+                    id,
+                    created,
+                    frontend_model,
+                    "Tool call has empty id in upstream response",
+                    request_context,
+                );
+            }
+            if !seen_call_ids.insert(call_id) {
+                return failed_response(
+                    id,
+                    created,
+                    frontend_model,
+                    "Duplicate tool call id in upstream response",
+                    request_context,
+                );
+            }
+
+            let Some(call_type) = call_obj.get("type").and_then(Value::as_str) else {
+                return failed_response(
+                    id,
+                    created,
+                    frontend_model,
+                    "Invalid tool call type in upstream response",
+                    request_context,
+                );
+            };
+            if call_type != "function" {
+                return failed_response(
+                    id,
+                    created,
+                    frontend_model,
+                    "Unsupported tool call type in upstream response",
+                    request_context,
+                );
+            }
+
+            let Some(function_obj) = call_obj.get("function").and_then(Value::as_object) else {
+                return failed_response(
+                    id,
+                    created,
+                    frontend_model,
+                    "Tool call missing function object in upstream response",
+                    request_context,
+                );
+            };
+
+            let Some(name) = function_obj.get("name").and_then(Value::as_str) else {
+                return failed_response(
+                    id,
+                    created,
+                    frontend_model,
+                    "Tool call function missing name in upstream response",
+                    request_context,
+                );
+            };
+            if name.is_empty() {
+                return failed_response(
+                    id,
+                    created,
+                    frontend_model,
+                    "Tool call function has empty name in upstream response",
+                    request_context,
+                );
+            }
+
+            let Some(arguments) = function_obj.get("arguments").and_then(Value::as_str) else {
+                return failed_response(
+                    id,
+                    created,
+                    frontend_model,
+                    "Tool call function missing arguments in upstream response",
+                    request_context,
+                );
+            };
+
+            let is_valid_json = serde_json::from_str::<Value>(arguments).is_ok();
+            if !is_valid_json && !is_truncated {
+                return failed_response(
+                    id,
+                    created,
+                    frontend_model,
+                    "Tool call function arguments is not valid JSON",
+                    request_context,
+                );
+            }
+
+            let item_id = format!("fc_{}", uuid::Uuid::new_v4().as_simple());
             output.push(json!({
-                "id": id,
-                "call_id": id,
+                "id": item_id,
                 "type": "function_call",
+                "call_id": call_id,
                 "name": name,
                 "arguments": arguments,
-                "status": "completed"
+                "status": item_status
             }));
         }
     }
 
-    json!({
-        "id": id,
-        "object": "response",
-        "created_at": created,
-        "status": "completed",
-        "model": frontend_model,
-        "output": output,
-        "usage": responses_usage(resp.get("usage")),
-    })
+    let (status, incomplete_details) = match finish_reason {
+        "stop" | "tool_calls" => ("completed", None),
+        "length" => ("incomplete", Some(json!({ "reason": "max_output_tokens" }))),
+        "content_filter" => ("incomplete", Some(json!({ "reason": "content_filter" }))),
+        _ => unreachable!(),
+    };
+
+    let mut resp_obj = Map::new();
+    resp_obj.insert("id".to_string(), json!(id));
+    resp_obj.insert("object".to_string(), json!("response"));
+    resp_obj.insert("created_at".to_string(), json!(created));
+    resp_obj.insert("status".to_string(), json!(status));
+    resp_obj.insert("model".to_string(), json!(frontend_model));
+    resp_obj.insert("output".to_string(), Value::Array(output));
+    resp_obj.insert("error".to_string(), Value::Null);
+    resp_obj.insert(
+        "incomplete_details".to_string(),
+        incomplete_details.unwrap_or(Value::Null),
+    );
+
+    match map_responses_usage(resp.get("usage")) {
+        Ok(usage) => {
+            resp_obj.insert("usage".to_string(), usage);
+        }
+        Err(issues) => tracing::warn!(
+            target: "llm_proxy::convert",
+            correlation_id = %id,
+            missing_fields = ?issues.missing_fields,
+            invalid_fields = ?issues.invalid_fields,
+            "upstream usage incomplete or invalid, omitted client usage without fabricating counts"
+        ),
+    }
+
+    apply_request_context_defaults(&mut resp_obj, request_context);
+
+    Value::Object(resp_obj)
+}
+
+#[derive(Default)]
+pub(crate) struct UsageValidationIssues {
+    pub(crate) missing_fields: Vec<&'static str>,
+    pub(crate) invalid_fields: Vec<&'static str>,
+}
+
+impl UsageValidationIssues {
+    fn object<'a>(
+        &mut self,
+        value: Option<&'a Value>,
+        field: &'static str,
+    ) -> Option<&'a Map<String, Value>> {
+        match value {
+            None => self.missing_fields.push(field),
+            Some(Value::Object(object)) => return Some(object),
+            Some(_) => self.invalid_fields.push(field),
+        }
+        None
+    }
+
+    fn counter(&mut self, value: Option<&Value>, field: &'static str) -> Option<i64> {
+        match value {
+            None => self.missing_fields.push(field),
+            Some(value) => match value.as_i64().filter(|count| *count >= 0) {
+                Some(count) => return Some(count),
+                None => self.invalid_fields.push(field),
+            },
+        }
+        None
+    }
+}
+
+pub(crate) fn map_responses_usage(
+    usage_val: Option<&Value>,
+) -> std::result::Result<Value, UsageValidationIssues> {
+    // ResponseUsage requires all three base counts, both detail objects, and
+    // their counters (including cache_write_tokens). Validate once; never fill
+    // gaps with zeros or the proxy's separately approved local accounting sum.
+    let mut issues = UsageValidationIssues::default();
+    let Some(usage) = issues.object(usage_val, "usage") else {
+        return Err(issues);
+    };
+    let input = issues.counter(usage.get("prompt_tokens"), "prompt_tokens");
+    let output = issues.counter(usage.get("completion_tokens"), "completion_tokens");
+    let total = issues.counter(usage.get("total_tokens"), "total_tokens");
+    let input_details = issues
+        .object(usage.get("prompt_tokens_details"), "prompt_tokens_details")
+        .map(|details| {
+            let cache_write = issues.counter(
+                details.get("cache_write_tokens"),
+                "prompt_tokens_details.cache_write_tokens",
+            );
+            let cached = issues.counter(
+                details.get("cached_tokens"),
+                "prompt_tokens_details.cached_tokens",
+            );
+            json!({"cache_write_tokens": cache_write, "cached_tokens": cached})
+        });
+    let output_details = issues
+        .object(
+            usage.get("completion_tokens_details"),
+            "completion_tokens_details",
+        )
+        .map(|details| {
+            let reasoning = issues.counter(
+                details.get("reasoning_tokens"),
+                "completion_tokens_details.reasoning_tokens",
+            );
+            json!({"reasoning_tokens": reasoning})
+        });
+    if !issues.missing_fields.is_empty() || !issues.invalid_fields.is_empty() {
+        return Err(issues);
+    }
+    Ok(json!({
+        "input_tokens": input,
+        "output_tokens": output,
+        "total_tokens": total,
+        "input_tokens_details": input_details,
+        "output_tokens_details": output_details
+    }))
+}
+
+pub(crate) fn apply_request_context_defaults(
+    resp_obj: &mut Map<String, Value>,
+    request_context: Option<&Value>,
+) {
+    let req = request_context.and_then(Value::as_object);
+    let tools = req
+        .and_then(|req| req.get("tools"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let default_choice = if tools.as_array().is_some_and(|tools| !tools.is_empty()) {
+        "auto"
+    } else {
+        "none"
+    };
+    // These envelope fields are required even when no tools were requested.
+    // Defaults depend on the request, never on generated function_call items.
+    resp_obj.insert(
+        "tool_choice".to_string(),
+        req.and_then(|req| req.get("tool_choice"))
+            .cloned()
+            .unwrap_or_else(|| json!(default_choice)),
+    );
+    resp_obj.insert(
+        "parallel_tool_calls".to_string(),
+        req.and_then(|req| req.get("parallel_tool_calls"))
+            .cloned()
+            .unwrap_or(Value::Bool(true)),
+    );
+    resp_obj.insert("tools".to_string(), tools);
 }

@@ -1,14 +1,8 @@
 use anyhow::{Context, Result};
 
 const DOCS: &[(&str, &str)] = &[
-    (
-        "cli-guide",
-        include_str!("../docs/user_guide/cli-guide.md"),
-    ),
-    (
-        "tui-guide",
-        include_str!("../docs/user_guide/tui-guide.md"),
-    ),
+    ("cli-guide", include_str!("../docs/user_guide/cli-guide.md")),
+    ("tui-guide", include_str!("../docs/user_guide/tui-guide.md")),
     (
         "troubleshooting",
         include_str!("../docs/user_guide/troubleshooting.md"),
@@ -18,6 +12,10 @@ const DOCS: &[(&str, &str)] = &[
         include_str!("../docs/user_guide/user-guide-oauth-accounts.md"),
     ),
 ];
+
+pub fn sections() -> &'static [(&'static str, &'static str)] {
+    DOCS
+}
 
 pub fn print_doc(list: bool, raw: bool, section: Option<String>) -> Result<()> {
     if list {

@@ -1,55 +1,25 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-use serial_test::serial;
-
 // Pull in all public API via the parent module's re-exports
 use super::*;
 
 // Pull in internal (pub(super)) items needed by tests
-use super::login::{
-    antigravity_scopes, build_antigravity_auth_url, exchange_antigravity_code,
-    generate_pkce_code_verifier, generate_state, pkce_challenge, poll_openai_device_token,
-    random_bytes, request_openai_device_code,
-};
 use super::refresh::{
     oauth_error_summary, refresh_account_with_urls, refreshed_token_from_json, value_u64,
 };
 use super::storage::{
     acquire_lock_with_timeout, backup_path_for, cleanup_old_backups, find_backups_newest_first,
-    validate_antigravity_account, validate_openai_account, validate_path_safety,
+    validate_path_safety,
 };
+use super::testutil::{server_only_config, test_openai_account};
 use super::types::unix_secs;
-
-fn test_openai_account(account: &str) -> OpenaiAccount {
-    let now = unix_secs() as i64;
-    OpenaiAccount {
-        account_label: format!("{account}@example.com"),
-        access_token: format!("access-token-{account}-1234567890"),
-        refresh_token: format!("refresh-token-{account}-1234567890"),
-        expires_at_unix: now + 3600,
-        updated_at_unix: now,
-    }
-}
-
-fn test_antigravity_account(account: &str) -> AntigravityAccount {
-    let now = unix_secs() as i64;
-    AntigravityAccount {
-        account_label: format!("{account}@example.com"),
-        project_id: "test-project-1".to_string(),
-        access_token: format!("access-token-{account}-1234567890"),
-        refresh_token: format!("refresh-token-{account}-1234567890"),
-        expires_at_unix: now + 3600,
-        updated_at_unix: now,
-    }
-}
 
 #[test]
 fn status_rows_do_not_expose_tokens() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("oauth_accounts.json");
-    let mut accounts = OAuthAccounts::new();
+    let mut accounts = AccountsFile::new();
     accounts.openai.insert(
         "openai-subscription".to_string(),
         test_openai_account("openai-subscription"),
@@ -75,7 +45,7 @@ fn status_rows_do_not_expose_tokens() {
 fn logout_provider_uses_configured_oauth_account_key() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("oauth_accounts.json");
-    let mut accounts = OAuthAccounts::new();
+    let mut accounts = AccountsFile::new();
     accounts.openai.insert(
         "shared-account".to_string(),
         test_openai_account("shared-account"),
@@ -100,168 +70,39 @@ url = "https://chatgpt.com/backend-api/codex/responses"
     );
     let remaining = load_oauth_accounts(&path).expect("read").0;
     assert!(remaining.openai.is_empty());
-    assert!(remaining.antigravity.is_empty());
+    assert!(remaining.openai.is_empty() && remaining.others.is_empty());
 }
 
 #[test]
 fn logout_removes_one_or_all_accounts() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("oauth_accounts.json");
-    let mut accounts = OAuthAccounts::new();
+    let mut accounts = AccountsFile::new();
     accounts.openai.insert(
         "openai-subscription".to_string(),
         test_openai_account("openai-subscription"),
     );
-    accounts.antigravity.insert(
-        "antigravity".to_string(),
-        test_antigravity_account("antigravity"),
+    accounts.openai.insert(
+        "openai-work".to_string(),
+        test_openai_account("openai-work"),
     );
     save_oauth_accounts(&path, &accounts).expect("write");
 
-    assert_eq!(logout(&path, Some("antigravity")).expect("logout"), 1);
+    assert_eq!(logout(&path, Some("openai-work")).expect("logout"), 1);
     let remaining = load_oauth_accounts(&path).expect("read").0;
     assert!(remaining.openai.contains_key("openai-subscription"));
-    assert!(!remaining.antigravity.contains_key("antigravity"));
+    assert!(!remaining.openai.contains_key("openai-work"));
 
     assert_eq!(logout(&path, None).expect("logout all"), 1);
     let remaining = load_oauth_accounts(&path).expect("read all").0;
     assert!(remaining.openai.is_empty());
-    assert!(remaining.antigravity.is_empty());
-}
-
-#[test]
-fn antigravity_auth_url_contains_pkce_and_scopes() {
-    let url = build_antigravity_auth_url("https://accounts.example/auth", "state-1", "challenge-1")
-        .expect("url");
-    let parsed = url::Url::parse(&url).expect("parse");
-    let pairs = parsed
-        .query_pairs()
-        .collect::<std::collections::BTreeMap<_, _>>();
-    assert_eq!(pairs.get("response_type").map(|v| v.as_ref()), Some("code"));
-    assert_eq!(pairs.get("state").map(|v| v.as_ref()), Some("state-1"));
-    assert_eq!(
-        pairs.get("code_challenge_method").map(|v| v.as_ref()),
-        Some("S256")
-    );
-    assert!(
-        pairs
-            .get("scope")
-            .expect("scope")
-            .contains("https://www.googleapis.com/auth/cloud-platform")
-    );
-}
-
-#[test]
-fn pkce_challenge_is_deterministic_sha256_base64url() {
-    assert_eq!(
-        pkce_challenge("verifier"),
-        "iMnq5o6zALKXGivsnlom_0F5_WYda32GHkxlV7mq7hQ"
-    );
-}
-
-#[tokio::test]
-async fn antigravity_project_id_uses_load_code_assist_then_onboard_fallback() {
-    let app = axum::Router::new()
-            .route(
-                "/load",
-                axum::routing::post(|| async {
-                    axum::Json(serde_json::json!({"cloudaicompanionProject": {"id": "project-load"}}))
-                }),
-            )
-            .route(
-                "/load-empty",
-                axum::routing::post(|| async { axum::Json(serde_json::json!({})) }),
-            )
-            .route(
-                "/onboard",
-                axum::routing::post(|| async {
-                    axum::Json(serde_json::json!({"response": {"cloudaicompanionProject": {"id": "project-onboard"}}}))
-                }),
-            );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
-
-    assert_eq!(
-        super::login::fetch_antigravity_project_id(
-            &format!("http://{addr}/load"),
-            &format!("http://{addr}/onboard"),
-            "token",
-        )
-        .await
-        .expect("load"),
-        "project-load"
-    );
-    assert_eq!(
-        super::login::fetch_antigravity_project_id(
-            &format!("http://{addr}/load-empty"),
-            &format!("http://{addr}/onboard"),
-            "token",
-        )
-        .await
-        .expect("fallback"),
-        "project-onboard"
-    );
-}
-
-#[tokio::test]
-async fn openai_device_code_accepts_alias_fields_and_string_numbers() {
-    let app = axum::Router::new().route(
-        "/device",
-        axum::routing::post(|| async {
-            axum::Json(serde_json::json!({
-                "deviceAuthID": "dev-123",
-                "usercode": "ABCD-1234",
-                "expires_in": "900",
-                "interval": "1"
-            }))
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
-
-    let code = request_openai_device_code(&format!("http://{addr}/device"))
-        .await
-        .expect("device code");
-    assert_eq!(code.device_auth_id, "dev-123");
-    assert_eq!(code.user_code, "ABCD-1234");
-    assert_eq!(code.expires_in, 900);
-    assert_eq!(code.interval, 1);
-}
-
-#[tokio::test]
-async fn openai_device_poll_pending_on_403_or_404() {
-    for status in [
-        reqwest::StatusCode::FORBIDDEN,
-        reqwest::StatusCode::NOT_FOUND,
-    ] {
-        let app = axum::Router::new().route(
-            "/poll",
-            axum::routing::post(move || async move { (status, "pending") }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
-
-        let poll = poll_openai_device_token(&format!("http://{addr}/poll"), "dev", "code")
-            .await
-            .expect("poll");
-        assert!(poll.is_none());
-    }
 }
 
 #[tokio::test]
 async fn refresh_account_updates_access_token_and_keeps_old_refresh_when_missing() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("oauth_accounts.json");
-    let mut accounts = OAuthAccounts::new();
+    let mut accounts = AccountsFile::new();
     let mut acct = test_openai_account("acct");
     acct.expires_at_unix = 1000000001;
     acct.updated_at_unix = 1000000000;
@@ -288,7 +129,6 @@ async fn refresh_account_updates_access_token_and_keeps_old_refresh_when_missing
         "acct",
         "openai_oauth",
         &format!("http://{addr}/token"),
-        "http://127.0.0.1:9/token",
     )
     .await
     .expect("refresh");
@@ -306,35 +146,6 @@ async fn refresh_account_updates_access_token_and_keeps_old_refresh_when_missing
 }
 
 #[test]
-fn get_openai_token_returns_token_and_rejects_missing_or_expired() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let path = temp.path().join("oauth_accounts.json");
-    let mut accounts = OAuthAccounts::new();
-    accounts
-        .openai
-        .insert("work".to_string(), test_openai_account("work"));
-    let mut expired = test_openai_account("expired");
-    expired.expires_at_unix = 1000000001;
-    expired.updated_at_unix = 1000000000;
-    accounts.openai.insert("expired".to_string(), expired);
-    save_oauth_accounts(&path, &accounts).expect("write");
-
-    assert_eq!(
-        get_openai_token(&path, "work", "openai-subscription").expect("token"),
-        "access-token-work-1234567890"
-    );
-    let err =
-        get_openai_token(&path, "missing", "openai-subscription").expect_err("missing account");
-    assert!(err.to_string().contains("not found"));
-    let err =
-        get_openai_token(&path, "expired", "openai-subscription").expect_err("expired account");
-    assert!(err.to_string().contains("expired"));
-    // 账号存在于错误的分组时同样视为未登录
-    let err = get_antigravity_token(&path, "work", "antigravity").expect_err("wrong group");
-    assert!(err.to_string().contains("not found"));
-}
-
-#[test]
 fn get_token_requires_login_when_file_missing() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("oauth_accounts.json");
@@ -346,7 +157,7 @@ fn get_token_requires_login_when_file_missing() {
 fn save_creates_backup_and_keeps_only_three() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("oauth_accounts.json");
-    let accounts = OAuthAccounts::new();
+    let accounts = AccountsFile::new();
     save_oauth_accounts(&path, &accounts).expect("initial write");
     // 首次写入不产生备份
     assert!(find_backups_newest_first(&path).is_empty());
@@ -383,7 +194,7 @@ fn acquire_lock_times_out_when_held() {
 fn load_recovers_from_backup_when_file_corrupted() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("oauth_accounts.json");
-    let mut accounts = OAuthAccounts::new();
+    let mut accounts = AccountsFile::new();
     accounts
         .openai
         .insert("work".to_string(), test_openai_account("work"));
@@ -404,12 +215,12 @@ fn load_and_save_reject_symlink_path() {
     let temp = tempfile::tempdir().expect("tempdir");
     let real = temp.path().join("real.json");
     let link = temp.path().join("oauth_accounts.json");
-    save_oauth_accounts(&real, &OAuthAccounts::new()).expect("write real");
+    save_oauth_accounts(&real, &AccountsFile::new()).expect("write real");
     std::os::unix::fs::symlink(&real, &link).expect("symlink");
 
     let err = load_oauth_accounts(&link).expect_err("symlink load");
     assert!(err.to_string().contains("symbolic link"));
-    let err = save_oauth_accounts(&link, &OAuthAccounts::new()).expect_err("symlink save");
+    let err = save_oauth_accounts(&link, &AccountsFile::new()).expect_err("symlink save");
     assert!(err.to_string().contains("symbolic link"));
 }
 
@@ -420,7 +231,7 @@ fn oauth_accounts_file_is_owner_only_on_unix() {
 
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("oauth_accounts.json");
-    save_oauth_accounts(&path, &OAuthAccounts::new()).expect("write");
+    save_oauth_accounts(&path, &AccountsFile::new()).expect("write");
     let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
 }
@@ -451,11 +262,37 @@ fn locked_updates_merge_changes_from_interleaved_writers() {
     assert!(accounts.openai.contains_key("process-b"));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn refresh_failure_returns_refresh_id_without_account_id() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("oauth_accounts.json");
+    let account_id = "private-account-id";
+    let mut accounts = AccountsFile::new();
+    let mut account = test_openai_account(account_id);
+    account.updated_at_unix = 1_000_000_000;
+    accounts.openai.insert(account_id.to_string(), account);
+    save_oauth_accounts(&path, &accounts).expect("write isolated OAuth state");
+
+    let error = super::refresh::refresh_account_with_urls_context(
+        &path,
+        account_id,
+        "openai_oauth",
+        "http://127.0.0.1:9/token",
+        super::refresh::RefreshContext::new("configured-provider", "isolated_failure_test"),
+    )
+    .await
+    .expect_err("unreachable OAuth endpoint must fail");
+    let message = format!("{error:#}");
+
+    assert!(message.contains("refresh_id="));
+    assert!(!message.contains(account_id));
+}
+
 #[tokio::test]
 async fn refresh_skips_when_recently_refreshed_but_forces_otherwise() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("oauth_accounts.json");
-    let mut accounts = OAuthAccounts::new();
+    let mut accounts = AccountsFile::new();
     // 未过期且刚刚刷新（模拟另一个进程刚完成 refresh）
     accounts
         .openai
@@ -463,15 +300,9 @@ async fn refresh_skips_when_recently_refreshed_but_forces_otherwise() {
     save_oauth_accounts(&path, &accounts).expect("write");
 
     // 不可达地址：若真的发起 HTTP 刷新会报错，从而证明 skip 生效
-    refresh_account_with_urls(
-        &path,
-        "acct",
-        "openai_oauth",
-        "http://127.0.0.1:9/token",
-        "http://127.0.0.1:9/token",
-    )
-    .await
-    .expect("skip refresh");
+    refresh_account_with_urls(&path, "acct", "openai_oauth", "http://127.0.0.1:9/token")
+        .await
+        .expect("skip refresh");
 
     // updated_at 较旧的未过期 token：手动 refresh 仍强制执行
     let mut accounts = load_oauth_accounts(&path).expect("read").0;
@@ -499,7 +330,6 @@ async fn refresh_skips_when_recently_refreshed_but_forces_otherwise() {
         "acct",
         "openai_oauth",
         &format!("http://{addr}/token"),
-        "http://127.0.0.1:9/token",
     )
     .await
     .expect("forced refresh");
@@ -515,7 +345,7 @@ async fn refresh_skips_when_recently_refreshed_but_forces_otherwise() {
 fn recovery_writes_back_to_main_file() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("oauth_accounts.json");
-    let mut accounts = OAuthAccounts::new();
+    let mut accounts = AccountsFile::new();
     accounts
         .openai
         .insert("work".to_string(), test_openai_account("work"));
@@ -535,7 +365,7 @@ fn recovery_writes_back_to_main_file() {
 fn recovery_tries_older_backups_when_newest_is_invalid() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("oauth_accounts.json");
-    let mut accounts = OAuthAccounts::new();
+    let mut accounts = AccountsFile::new();
     accounts
         .openai
         .insert("work".to_string(), test_openai_account("work"));
@@ -573,7 +403,7 @@ fn version_mismatch_skips_recovery() {
     .expect("write newer version");
 
     // 同时写入一个有效的 v1 备份
-    let mut accounts = OAuthAccounts::new();
+    let mut accounts = AccountsFile::new();
     accounts
         .openai
         .insert("work".to_string(), test_openai_account("work"));
@@ -598,98 +428,6 @@ fn version_mismatch_skips_recovery() {
         content.contains("\"version\": 2"),
         "main file should not be overwritten by backup"
     );
-}
-
-#[test]
-fn test_validate_antigravity_account_success_and_failures() {
-    let valid_acc = test_antigravity_account("valid_activity");
-    assert!(validate_antigravity_account("valid_activity", &valid_acc).is_ok());
-
-    // 空 ID
-    assert!(validate_antigravity_account("", &valid_acc).is_err());
-
-    // 非法字符
-    assert!(validate_antigravity_account("invalid@id!", &valid_acc).is_err());
-
-    // ID 过长 (>64)
-    let long_id = "a".repeat(65);
-    assert!(validate_antigravity_account(&long_id, &valid_acc).is_err());
-
-    // token 相同
-    let mut bad = valid_acc.clone();
-    bad.refresh_token = bad.access_token.clone();
-    assert!(validate_antigravity_account("valid_activity", &bad).is_err());
-
-    // access_token 过短 (<20)
-    let mut bad = valid_acc.clone();
-    bad.access_token = "short".to_string();
-    assert!(validate_antigravity_account("valid_activity", &bad).is_err());
-
-    // refresh_token 过短 (<20)
-    let mut bad = valid_acc.clone();
-    bad.refresh_token = "short".to_string();
-    assert!(validate_antigravity_account("valid_activity", &bad).is_err());
-
-    // expires_at_unix 非法 (<1000000000)
-    let mut bad = valid_acc.clone();
-    bad.expires_at_unix = 999_999_999;
-    assert!(validate_antigravity_account("valid_activity", &bad).is_err());
-
-    // updated_at_unix 非法 (<1000000000)
-    let mut bad = valid_acc.clone();
-    bad.updated_at_unix = 999_999_999;
-    assert!(validate_antigravity_account("valid_activity", &bad).is_err());
-
-    // updated_at_unix > expires_at_unix
-    let mut bad = valid_acc.clone();
-    bad.updated_at_unix = bad.expires_at_unix + 100;
-    assert!(validate_antigravity_account("valid_activity", &bad).is_err());
-
-    // project_id 格式非法
-    let mut bad = valid_acc.clone();
-    bad.project_id = "INVALID_PROJ!".to_string();
-    assert!(validate_antigravity_account("valid_activity", &bad).is_err());
-}
-
-#[test]
-fn test_validate_openai_account_success_and_failures() {
-    let valid_acc = test_openai_account("valid_account");
-    assert!(validate_openai_account("valid_account", &valid_acc).is_ok());
-
-    // 空 ID
-    assert!(validate_openai_account("", &valid_acc).is_err());
-
-    // 非法字符
-    assert!(validate_openai_account("invalid#id", &valid_acc).is_err());
-
-    // ID 过长 (>64)
-    let long_id = "b".repeat(65);
-    assert!(validate_openai_account(&long_id, &valid_acc).is_err());
-
-    // token 相同
-    let mut bad = valid_acc.clone();
-    bad.refresh_token = bad.access_token.clone();
-    assert!(validate_openai_account("valid_account", &bad).is_err());
-
-    // access_token 过短 (<20)
-    let mut bad = valid_acc.clone();
-    bad.access_token = "short".to_string();
-    assert!(validate_openai_account("valid_account", &bad).is_err());
-
-    // refresh_token 过短 (<20)
-    let mut bad = valid_acc.clone();
-    bad.refresh_token = "short".to_string();
-    assert!(validate_openai_account("valid_account", &bad).is_err());
-
-    // expires_at_unix 非法
-    let mut bad = valid_acc.clone();
-    bad.expires_at_unix = 500;
-    assert!(validate_openai_account("valid_account", &bad).is_err());
-
-    // updated_at_unix > expires_at_unix
-    let mut bad = valid_acc.clone();
-    bad.updated_at_unix = bad.expires_at_unix + 10;
-    assert!(validate_openai_account("valid_account", &bad).is_err());
 }
 
 #[test]
@@ -783,6 +521,23 @@ fn test_unix_secs_returns_valid_timestamp() {
 }
 
 #[test]
+fn test_state_path_for_config_uses_config_directory() {
+    let path = super::storage::state_path_for_config(Path::new("/tmp/instance/config.toml"));
+    assert_eq!(path, PathBuf::from("/tmp/instance/oauth_accounts.json"));
+}
+
+#[test]
+fn test_state_path_for_config_keeps_default_layout_compatible() {
+    let path = super::storage::state_path_for_config(Path::new(
+        "/home/user/.config/llm-proxy/config.toml",
+    ));
+    assert_eq!(
+        path,
+        PathBuf::from("/home/user/.config/llm-proxy/oauth_accounts.json")
+    );
+}
+
+#[test]
 fn test_default_state_path_returns_expected_path() {
     let path = default_state_path();
     assert!(
@@ -793,20 +548,11 @@ fn test_default_state_path_returns_expected_path() {
 }
 
 #[test]
-fn test_default_state_path_respects_state_dir_env() {
-    let key = "LLM_PROXY_STATE_DIR";
-    let old = std::env::var(key).ok();
-    unsafe {
-        std::env::set_var(key, "/tmp/test-state-dir");
-    }
-    let path = default_state_path();
-    match old {
-        Some(v) => unsafe { std::env::set_var(key, v) },
-        None => unsafe { std::env::remove_var(key) },
-    }
+fn test_default_state_path_respects_xdg_config_home() {
+    let path = super::storage::default_state_path_in(PathBuf::from("/tmp/test-xdg-config"));
     assert!(
-        path.starts_with("/tmp/test-state-dir"),
-        "expected path under /tmp/test-state-dir, got: {}",
+        path.starts_with("/tmp/test-xdg-config"),
+        "expected path under /tmp/test-xdg-config, got: {}",
         path.display()
     );
     assert!(path.ends_with("oauth_accounts.json"));
@@ -821,8 +567,8 @@ listen = "127.0.0.1:8989"
 [providers.openai-explicit]
 auth = { type = "openai_oauth", account = "my-custom-account" }
 
-[providers.antigravity-default]
-auth = { type = "antigravity_oauth" }
+[providers.openai-default]
+auth = { type = "openai_oauth" }
 
 [providers.api-key-prov]
 auth = { type = "api_key_env", env = "SOME_KEY" }
@@ -834,8 +580,8 @@ auth = { type = "api_key_env", env = "SOME_KEY" }
     assert_eq!(acc1, "my-custom-account");
 
     // 默认与 provider_id 相同的 account
-    let acc2 = oauth_account_for_provider(&cfg, "antigravity-default").expect("account");
-    assert_eq!(acc2, "antigravity-default");
+    let acc2 = oauth_account_for_provider(&cfg, "openai-default").expect("account");
+    assert_eq!(acc2, "openai-default");
 
     // 非 OAuth provider
     let err1 = oauth_account_for_provider(&cfg, "api-key-prov").expect_err("non-oauth");
@@ -846,276 +592,27 @@ auth = { type = "api_key_env", env = "SOME_KEY" }
     assert!(err2.to_string().contains("unknown provider"));
 }
 
-#[test]
-fn test_build_antigravity_auth_url_valid_and_invalid() {
-    let url = build_antigravity_auth_url(
-        "https://accounts.google.com/o/oauth2/v2/auth",
-        "state_123",
-        "challenge_456",
-    )
-    .expect("build url");
-    let parsed = url::Url::parse(&url).expect("parse url");
-    let query: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-
-    assert_eq!(query.get("state").map(|s| s.as_str()), Some("state_123"));
-    assert_eq!(
-        query.get("code_challenge").map(|s| s.as_str()),
-        Some("challenge_456")
-    );
-    assert_eq!(
-        query.get("code_challenge_method").map(|s| s.as_str()),
-        Some("S256")
-    );
-    assert_eq!(query.get("response_type").map(|s| s.as_str()), Some("code"));
-    assert_eq!(
-        query.get("access_type").map(|s| s.as_str()),
-        Some("offline")
-    );
-    assert_eq!(query.get("prompt").map(|s| s.as_str()), Some("consent"));
-
-    let invalid = build_antigravity_auth_url("invalid-url-str", "s", "c");
-    assert!(invalid.is_err());
-}
-
-#[test]
-fn test_antigravity_scopes_returns_expected_list() {
-    let scopes = antigravity_scopes();
-    assert!(!scopes.is_empty());
-    assert!(scopes.contains(&"https://www.googleapis.com/auth/cloud-platform"));
-    assert!(scopes.contains(&"https://www.googleapis.com/auth/userinfo.email"));
-    assert!(scopes.contains(&"https://www.googleapis.com/auth/userinfo.profile"));
-    assert!(scopes.contains(&"https://www.googleapis.com/auth/cclog"));
-    assert!(scopes.contains(&"https://www.googleapis.com/auth/experimentsandconfigs"));
-}
-
-#[test]
-fn test_crypto_utils_generate_verifier_state_random_and_challenge() {
-    let rnd = random_bytes(16).expect("random bytes");
-    assert_eq!(rnd.len(), 16);
-
-    let verifier = generate_pkce_code_verifier().expect("verifier");
-    assert!(!verifier.is_empty());
-
-    let state = generate_state().expect("state");
-    assert!(!state.is_empty());
-
-    let challenge = pkce_challenge("verifier");
-    assert_eq!(challenge, "iMnq5o6zALKXGivsnlom_0F5_WYda32GHkxlV7mq7hQ");
-}
-
-// =========================================================================
-// 补充测试：validate_antigravity_account 边界条件
-// =========================================================================
-
-#[test]
-fn validate_antigravity_id_boundary_at_64_chars_is_ok() {
-    // 恰好 64 字符的 ID 应通过
-    let valid_acc = test_antigravity_account("boundary");
-    let id_64 = "a".repeat(64);
-    assert!(
-        validate_antigravity_account(&id_64, &valid_acc).is_ok(),
-        "64-char ID should be accepted"
-    );
-}
-
-#[test]
-fn validate_antigravity_token_boundary_at_exactly_20_chars_is_ok() {
-    // 恰好 20 个字符的 token 应通过（≥ 20 有效）
-    let mut acc = test_antigravity_account("tok");
-    acc.access_token = "a".repeat(20);
-    acc.refresh_token = "b".repeat(20);
-    assert!(
-        validate_antigravity_account("tok", &acc).is_ok(),
-        "20-char token should be accepted"
-    );
-}
-
-#[test]
-fn validate_antigravity_token_at_19_chars_is_rejected() {
-    // 19 个字符的 token 不通过（< 20）
-    let mut acc = test_antigravity_account("tok");
-    acc.access_token = "a".repeat(19);
-    assert!(
-        validate_antigravity_account("tok", &acc).is_err(),
-        "19-char access_token should be rejected"
-    );
-    let mut acc2 = test_antigravity_account("tok2");
-    acc2.refresh_token = "b".repeat(19);
-    assert!(
-        validate_antigravity_account("tok2", &acc2).is_err(),
-        "19-char refresh_token should be rejected"
-    );
-}
-
-#[test]
-fn validate_antigravity_project_id_boundary_cases() {
-    let base = test_antigravity_account("proj-test");
-
-    // 最短合法 project_id (6 chars: a + 4 middle + z0)
-    let mut acc = base.clone();
-    acc.project_id = "abc123".to_string(); // 6 chars, valid
-    assert!(
-        validate_antigravity_account("proj-test", &acc).is_ok(),
-        "6-char project_id should be ok"
-    );
-
-    // 太短 (5 chars: 不满足 4,28 中间)
-    let mut acc = base.clone();
-    acc.project_id = "ab12z".to_string(); // 5 chars total
-    assert!(
-        validate_antigravity_account("proj-test", &acc).is_err(),
-        "5-char project_id should fail"
-    );
-
-    // 以数字开头（不合法）
-    let mut acc = base.clone();
-    acc.project_id = "1invalid-start".to_string();
-    assert!(
-        validate_antigravity_account("proj-test", &acc).is_err(),
-        "project_id starting with digit should fail"
-    );
-
-    // 以连字符结尾（不合法）
-    let mut acc = base.clone();
-    acc.project_id = "invalid-end-".to_string();
-    assert!(
-        validate_antigravity_account("proj-test", &acc).is_err(),
-        "project_id ending with hyphen should fail"
-    );
-
-    // 含大写字母（不合法）
-    let mut acc = base.clone();
-    acc.project_id = "Invalid-Project".to_string();
-    assert!(
-        validate_antigravity_account("proj-test", &acc).is_err(),
-        "project_id with uppercase should fail"
-    );
-}
-
-#[test]
-fn validate_antigravity_account_id_allows_hyphen_and_underscore() {
-    let acc = test_antigravity_account("hyphens");
-    // 连字符和下划线应被允许
-    assert!(validate_antigravity_account("my-account_id", &acc).is_ok());
-    assert!(validate_antigravity_account("my-account", &acc).is_ok());
-    assert!(validate_antigravity_account("my_account", &acc).is_ok());
-}
-
-#[test]
-fn validate_antigravity_updated_at_equal_to_expires_at_is_ok() {
-    // updated_at == expires_at 是合法的（边界值：相等时不违反 >）
-    let mut acc = test_antigravity_account("eq-times");
-    acc.updated_at_unix = acc.expires_at_unix;
-    assert!(
-        validate_antigravity_account("eq-times", &acc).is_ok(),
-        "updated_at == expires_at should be ok"
-    );
-}
-
-#[test]
-fn antigravity_account_is_expired_checks_unix_time() {
-    let now = unix_secs() as i64;
-    let mut acc = test_antigravity_account("expiry");
-
-    // 未过期
-    acc.expires_at_unix = now + 3600;
-    assert!(!acc.is_expired(), "future expiry should not be expired");
-
-    // 已过期
-    acc.expires_at_unix = now - 1;
-    assert!(acc.is_expired(), "past expiry should be expired");
-
-    // 恰好到期（expires_at <= now 时算过期）
-    acc.expires_at_unix = now;
-    assert!(acc.is_expired(), "current unix second should be expired");
-}
-
-#[test]
-fn openai_account_is_expired_checks_unix_time() {
-    let now = unix_secs() as i64;
-    let mut acc = test_openai_account("expiry");
-
-    acc.expires_at_unix = now + 3600;
-    assert!(!acc.is_expired(), "future expiry should not be expired");
-
-    acc.expires_at_unix = now - 1;
-    assert!(acc.is_expired(), "past expiry should be expired");
-
-    acc.expires_at_unix = now;
-    assert!(acc.is_expired(), "current unix second should be expired");
-}
-
 // =========================================================================
 // 补充测试：validate_openai_account 遗漏的边界条件
 // =========================================================================
 
-#[test]
-fn validate_openai_account_id_boundary_at_64_chars_is_ok() {
-    let acc = test_openai_account("boundary");
-    let id_64 = "z".repeat(64);
-    assert!(
-        validate_openai_account(&id_64, &acc).is_ok(),
-        "64-char ID should be accepted"
-    );
-}
-
-#[test]
-fn validate_openai_token_boundary_at_exactly_20_chars_is_ok() {
-    let mut acc = test_openai_account("tok");
-    acc.access_token = "a".repeat(20);
-    acc.refresh_token = "b".repeat(20);
-    assert!(
-        validate_openai_account("tok", &acc).is_ok(),
-        "20-char tokens should be accepted"
-    );
-}
-
-#[test]
-fn validate_openai_updated_at_unix_too_small_is_rejected() {
-    // 现有测试没有覆盖 openai 的 updated_at_unix < 1000000000 分支
-    let mut acc = test_openai_account("small-updated");
-    acc.updated_at_unix = 999_999_999;
-    assert!(
-        validate_openai_account("small-updated", &acc).is_err(),
-        "updated_at_unix < 1_000_000_000 should be rejected"
-    );
-}
-
-#[test]
-fn validate_openai_updated_at_equal_to_expires_at_is_ok() {
-    let mut acc = test_openai_account("eq-times");
-    acc.updated_at_unix = acc.expires_at_unix;
-    assert!(
-        validate_openai_account("eq-times", &acc).is_ok(),
-        "updated_at == expires_at should be ok"
-    );
-}
-
-#[test]
-fn validate_openai_account_id_allows_hyphen_and_underscore() {
-    let acc = test_openai_account("hyphens");
-    assert!(validate_openai_account("my-account_id", &acc).is_ok());
-    assert!(validate_openai_account("my-account", &acc).is_ok());
-    assert!(validate_openai_account("my_account", &acc).is_ok());
-}
-
 // =========================================================================
-// 补充测试：OAuthAccounts 结构体验证
+// 补充测试：AccountsFile 结构体验证
 // =========================================================================
 
 #[test]
 fn oauth_accounts_new_has_version_one_and_empty_maps() {
-    let accounts = OAuthAccounts::new();
+    let accounts = AccountsFile::new();
     assert_eq!(accounts.version, 1);
-    assert!(accounts.antigravity.is_empty());
+    assert!(accounts.openai.is_empty() && accounts.others.is_empty());
     assert!(accounts.openai.is_empty());
 }
 
 #[test]
 fn oauth_accounts_default_is_equivalent_to_new() {
-    let default_acc = OAuthAccounts::default();
+    let default_acc = AccountsFile::default();
     assert_eq!(default_acc.version, 0); // Default derives to 0, not 1
-    assert!(default_acc.antigravity.is_empty());
+    assert!(default_acc.openai.is_empty() && default_acc.others.is_empty());
     assert!(default_acc.openai.is_empty());
 }
 
@@ -1159,7 +656,7 @@ fn load_oauth_accounts_returns_not_found_as_empty() {
     let path = Path::new("/tmp/nonexistent_oauth_test_file_xyz.json");
     let (accounts, skipped) = load_oauth_accounts(path).expect("not found should be empty");
     assert!(accounts.openai.is_empty());
-    assert!(accounts.antigravity.is_empty());
+    assert!(accounts.openai.is_empty() && accounts.others.is_empty());
     assert!(skipped.is_empty());
 }
 
@@ -1196,168 +693,46 @@ fn save_and_reload_both_account_types_roundtrip() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("accounts.json");
 
-    let mut accounts = OAuthAccounts::new();
+    let mut accounts = AccountsFile::new();
     accounts.openai.insert(
         "openai-user".to_string(),
         test_openai_account("openai-user"),
     );
-    accounts
-        .antigravity
-        .insert("ag-user".to_string(), test_antigravity_account("ag-user"));
+    accounts.others.insert(
+        "ag-user".to_string(),
+        serde_json::Value::String("ag-user".to_string()),
+    );
     save_oauth_accounts(&path, &accounts).expect("save");
 
     let (loaded, skipped) = load_oauth_accounts(&path).expect("load");
     assert!(loaded.openai.contains_key("openai-user"));
-    assert!(loaded.antigravity.contains_key("ag-user"));
     assert!(skipped.is_empty());
+    // 注：load 只重建类型化分组（flatten 的 others 不参与逐账号校验重建，与
+    // 基线行为一致）；此处断言 save 侧原样落盘——以文件内容为证。
+    let raw = std::fs::read_to_string(&path).expect("read back");
+    assert!(raw.contains("ag-user"), "others 必须随 save 落盘：{raw}");
 }
 
 #[test]
 fn added_account_exists_recognizes_aliases_and_unknown_types() {
-    let mut accounts = OAuthAccounts::new();
+    let mut accounts = AccountsFile::new();
     accounts
         .openai
         .insert("oa".into(), test_openai_account("oa"));
     accounts
-        .antigravity
-        .insert("ag".into(), test_antigravity_account("ag"));
+        .others
+        .insert("ag".into(), serde_json::Value::String("ag".into()));
     assert!(account_exists(&accounts, "oa", "openai"));
     assert!(account_exists(&accounts, "oa", "openai_oauth"));
-    assert!(account_exists(&accounts, "ag", "antigravity"));
-    assert!(account_exists(&accounts, "ag", "antigravity_oauth"));
     assert!(!account_exists(&accounts, "oa", "bogus"));
     assert!(!account_exists(&accounts, "missing", "openai"));
-}
-
-#[test]
-fn added_get_openai_token_from_accounts_success_missing_and_expired() {
-    let mut accounts = OAuthAccounts::new();
-    let acc = test_openai_account("oa");
-    let token = acc.access_token.clone();
-    accounts.openai.insert("oa".into(), acc);
-    assert_eq!(
-        get_openai_token_from_accounts(&accounts, "oa", "prov").unwrap(),
-        token
-    );
-    assert!(
-        get_openai_token_from_accounts(&accounts, "missing", "prov")
-            .unwrap_err()
-            .to_string()
-            .contains("not found")
-    );
-    accounts.openai.get_mut("oa").unwrap().expires_at_unix = unix_secs() as i64 - 1;
-    assert!(
-        get_openai_token_from_accounts(&accounts, "oa", "prov")
-            .unwrap_err()
-            .to_string()
-            .contains("expired")
-    );
-}
-
-#[test]
-fn added_get_antigravity_token_from_accounts_success_missing_and_expired() {
-    let mut accounts = OAuthAccounts::new();
-    let acc = test_antigravity_account("ag");
-    let token = acc.access_token.clone();
-    accounts.antigravity.insert("ag".into(), acc);
-    assert_eq!(
-        get_antigravity_token_from_accounts(&accounts, "ag", "prov").unwrap(),
-        token
-    );
-    assert!(
-        get_antigravity_token_from_accounts(&accounts, "missing", "prov")
-            .unwrap_err()
-            .to_string()
-            .contains("not found")
-    );
-    accounts.antigravity.get_mut("ag").unwrap().expires_at_unix = unix_secs() as i64 - 1;
-    assert!(
-        get_antigravity_token_from_accounts(&accounts, "ag", "prov")
-            .unwrap_err()
-            .to_string()
-            .contains("expired")
-    );
-}
-
-#[test]
-#[serial]
-fn added_get_provider_auth_status_all_auth_variants() {
-    let cfg: crate::config::Config = toml::from_str(
-        r#"
-[server]
-listen = "127.0.0.1:8989"
-[providers.none]
-auth = { type = "none" }
-[providers.key]
-auth = { type = "api_key_env", env = "LLM_PROXY_AUTH_TEST_MISSING_KEY" }
-[providers.oa]
-auth = { type = "openai_oauth" }
-[providers.ag]
-auth = { type = "antigravity_oauth", account = "shared-ag" }
-"#,
-    )
-    .unwrap();
-    unsafe {
-        std::env::remove_var("LLM_PROXY_AUTH_TEST_MISSING_KEY");
-    }
-    let mut accounts = OAuthAccounts::new();
-    accounts
-        .openai
-        .insert("oa".into(), test_openai_account("oa"));
-    accounts
-        .antigravity
-        .insert("shared-ag".into(), test_antigravity_account("shared-ag"));
-    assert_eq!(
-        get_provider_auth_status(&cfg.providers["none"], "none", &accounts),
-        ProviderAuthStatus::Ready
-    );
-    assert_eq!(
-        get_provider_auth_status(&cfg.providers["key"], "key", &accounts),
-        ProviderAuthStatus::MissingKey("LLM_PROXY_AUTH_TEST_MISSING_KEY".into())
-    );
-    assert_eq!(
-        get_provider_auth_status(&cfg.providers["oa"], "oa", &accounts),
-        ProviderAuthStatus::Ready
-    );
-    assert_eq!(
-        get_provider_auth_status(&cfg.providers["ag"], "ag", &accounts),
-        ProviderAuthStatus::Ready
-    );
-    accounts.openai.get_mut("oa").unwrap().expires_at_unix = unix_secs() as i64 - 1;
-    assert_eq!(
-        get_provider_auth_status(&cfg.providers["oa"], "oa", &accounts),
-        ProviderAuthStatus::Expired
-    );
-    accounts.antigravity.clear();
-    assert_eq!(
-        get_provider_auth_status(&cfg.providers["ag"], "ag", &accounts),
-        ProviderAuthStatus::NotLoggedIn
-    );
-}
-
-#[test]
-fn added_status_rows_reports_expired_antigravity_and_skipped_invalid() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("accounts.json");
-    let expired = unix_secs() as i64 - 1;
-    let data = serde_json::json!({"version":1,"antigravity":{
-        "ag": {"account_label":"ag@example.com","project_id":"test-project-1","access_token":"access-token-ag-1234567890","refresh_token":"refresh-token-ag-1234567890","expires_at_unix": expired,"updated_at_unix":1000000000},
-        "bad!": {"account_label":"bad","project_id":"test-project-1","access_token":"access-token-bad-1234567890","refresh_token":"refresh-token-bad-1234567890","expires_at_unix":2000000000,"updated_at_unix":1000000000}
-    }});
-    fs::write(&path, data.to_string()).unwrap();
-    let (rows, skipped) = status_rows(&path).unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].state, "expired");
-    assert_eq!(rows[0].auth_type, "antigravity_oauth");
-    assert_eq!(skipped.len(), 1);
-    assert_eq!(skipped[0].account_id, "bad!");
 }
 
 #[test]
 fn added_logout_missing_account_does_not_create_backup_or_modify_file() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("accounts.json");
-    let mut accounts = OAuthAccounts::new();
+    let mut accounts = AccountsFile::new();
     accounts
         .openai
         .insert("oa".into(), test_openai_account("oa"));
@@ -1424,19 +799,19 @@ fn added_cleanup_old_backups_with_keep_larger_than_len_is_noop() {
 fn added_save_locked_replaces_existing_file_and_creates_backup() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("accounts.json");
-    let mut first = OAuthAccounts::new();
+    let mut first = AccountsFile::new();
     first
         .openai
         .insert("first".into(), test_openai_account("first"));
     save_oauth_accounts_locked(&path, &first).unwrap();
-    let mut second = OAuthAccounts::new();
+    let mut second = AccountsFile::new();
     second
-        .antigravity
-        .insert("second".into(), test_antigravity_account("second"));
+        .openai
+        .insert("second".into(), test_openai_account("second"));
     save_oauth_accounts_locked(&path, &second).unwrap();
     let loaded = load_oauth_accounts(&path).unwrap().0;
-    assert!(loaded.openai.is_empty());
-    assert!(loaded.antigravity.contains_key("second"));
+    assert!(loaded.openai.contains_key("second"));
+    assert!(!loaded.openai.contains_key("first"));
     assert_eq!(find_backups_newest_first(&path).len(), 1);
 }
 
@@ -1444,25 +819,6 @@ fn added_save_locked_replaces_existing_file_and_creates_backup() {
 fn added_validate_path_safety_allows_missing_path() {
     let temp = tempfile::tempdir().unwrap();
     assert!(validate_path_safety(&temp.path().join("missing.json")).is_ok());
-}
-
-#[test]
-fn added_load_oauth_accounts_skips_invalid_antigravity_reasons() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("accounts.json");
-    let data = serde_json::json!({"version":1,"antigravity":{
-        "good": {"account_label":"good","project_id":"test-project-1","access_token":"access-token-good-1234567890","refresh_token":"refresh-token-good-1234567890","expires_at_unix":2000000000,"updated_at_unix":1000000000},
-        "bad": {"account_label":"bad","project_id":"BadProject","access_token":"access-token-bad-1234567890","refresh_token":"refresh-token-bad-1234567890","expires_at_unix":2000000000,"updated_at_unix":1000000000}
-    }});
-    fs::write(&path, data.to_string()).unwrap();
-    let (accounts, skipped) = load_oauth_accounts(&path).unwrap();
-    assert!(accounts.antigravity.contains_key("good"));
-    assert_eq!(skipped.len(), 1);
-    assert!(
-        skipped[0]
-            .reason
-            .contains("invalid Google Cloud project ID")
-    );
 }
 
 #[test]
@@ -1501,62 +857,6 @@ fn added_recovery_all_backups_invalid_reports_manual_intervention() {
 }
 
 #[test]
-fn added_get_openai_token_file_success_and_missing_account() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("accounts.json");
-    let mut accounts = OAuthAccounts::new();
-    let acc = test_openai_account("oa");
-    let token = acc.access_token.clone();
-    accounts.openai.insert("oa".into(), acc);
-    save_oauth_accounts(&path, &accounts).unwrap();
-    assert_eq!(get_openai_token(&path, "oa", "prov").unwrap(), token);
-    assert!(
-        get_openai_token(&path, "missing", "prov")
-            .unwrap_err()
-            .to_string()
-            .contains("not found")
-    );
-}
-
-#[test]
-fn added_get_antigravity_token_file_success_and_missing_account() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("accounts.json");
-    let mut accounts = OAuthAccounts::new();
-    let acc = test_antigravity_account("ag");
-    let token = acc.access_token.clone();
-    accounts.antigravity.insert("ag".into(), acc);
-    save_oauth_accounts(&path, &accounts).unwrap();
-    assert_eq!(get_antigravity_token(&path, "ag", "prov").unwrap(), token);
-    assert!(
-        get_antigravity_token(&path, "missing", "prov")
-            .unwrap_err()
-            .to_string()
-            .contains("not found")
-    );
-}
-
-#[test]
-fn added_get_antigravity_token_expired_without_runtime_errors() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("accounts.json");
-    let mut accounts = OAuthAccounts::new();
-    let mut acc = test_antigravity_account("ag");
-    acc.expires_at_unix = unix_secs() as i64 - 1;
-    accounts.antigravity.insert("ag".into(), acc);
-    save_oauth_accounts(&path, &accounts).unwrap();
-    let err = get_antigravity_token(&path, "ag", "prov")
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("OAuth refresh request failed")
-            || err.contains("no runtime available")
-            || err.contains("not found"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
 fn added_validate_oauth_on_startup_ok_for_missing_file_and_missing_refs() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("accounts.json");
@@ -1567,13 +867,115 @@ listen = "127.0.0.1:8989"
 [providers.oa]
 auth = { type = "openai_oauth" }
 [providers.ag]
-auth = { type = "antigravity_oauth", account = "missing-ag" }
 "#,
     )
     .unwrap();
     validate_oauth_on_startup(&cfg, &path).unwrap();
-    save_oauth_accounts(&path, &OAuthAccounts::new()).unwrap();
+    save_oauth_accounts(&path, &AccountsFile::new()).unwrap();
     validate_oauth_on_startup(&cfg, &path).unwrap();
+}
+
+// startup reconciliation of the connect two-step write:
+// the credential half is expensive (only the user's OAuth flow produces it), so
+// a lost config half is *completed*, never reclaimed by deleting the credential.
+
+#[test]
+fn account_key_is_matched_through_the_catalog_not_by_guessing_the_provider_name() {
+    // The account key is not the provider name: a connect under a custom name
+    // rewrites the key. A key no template declares must be reported, never
+    // invented under a guessed provider name.
+    let mut accounts = AccountsFile::new();
+    accounts.openai.insert(
+        "openai-work-account".into(),
+        test_openai_account("openai-work-account"),
+    );
+    let mut cfg = server_only_config();
+
+    let report = recover_orphan_oauth_accounts(&mut cfg, &accounts);
+
+    assert!(report.recovered.is_empty(), "{report:?}");
+    assert_eq!(report.unrecoverable.len(), 1);
+    assert_eq!(report.unrecoverable[0].account, "openai-work-account");
+    assert_eq!(report.unrecoverable[0].auth_type, "openai");
+    assert!(cfg.providers.is_empty(), "nothing may be invented");
+}
+
+#[test]
+fn recovery_never_overwrites_a_provider_that_already_occupies_the_name() {
+    let mut accounts = AccountsFile::new();
+    accounts.openai.insert(
+        "custom-occupied".into(),
+        test_openai_account("custom-occupied"),
+    );
+    accounts
+        .openai
+        .insert("ag-alt".into(), test_openai_account("ag-alt"));
+    let mut cfg: crate::config::Config = toml::from_str(
+        r#"
+[server]
+listen = "127.0.0.1:8989"
+[providers.custom-occupied]
+auth = { type = "openai_oauth", account = "ag-alt" }
+"#,
+    )
+    .unwrap();
+
+    let report = recover_orphan_oauth_accounts(&mut cfg, &accounts);
+
+    // "ag-alt" is referenced by the existing provider, so only "custom-occupied"
+    // is an orphan — and its name is taken by a deliberate entry.
+    assert!(report.recovered.is_empty(), "{report:?}");
+    assert_eq!(report.unrecoverable.len(), 1);
+    assert_eq!(report.unrecoverable[0].account, "custom-occupied");
+    let provider = cfg.providers.get("custom-occupied").unwrap();
+    assert!(matches!(
+        &provider.auth,
+        Some(crate::config::AuthConfig::OpenaiOauth { account })
+            if account.as_deref() == Some("ag-alt")
+    ));
+}
+
+#[test]
+fn credential_referenced_by_a_custom_named_provider_is_not_an_orphan() {
+    let mut accounts = AccountsFile::new();
+    accounts.others.insert(
+        "ag-work".into(),
+        serde_json::Value::String("ag-work".into()),
+    );
+    let mut cfg: crate::config::Config = toml::from_str(
+        r#"
+[server]
+listen = "127.0.0.1:8989"
+[providers.ag-work]
+"#,
+    )
+    .unwrap();
+
+    let report = recover_orphan_oauth_accounts(&mut cfg, &accounts);
+
+    assert!(report.is_empty(), "{report:?}");
+    assert_eq!(cfg.providers.len(), 1);
+}
+
+#[test]
+fn provider_without_an_account_field_falls_back_to_its_own_name() {
+    let mut accounts = AccountsFile::new();
+    accounts
+        .openai
+        .insert("oa".into(), test_openai_account("oa"));
+    let mut cfg: crate::config::Config = toml::from_str(
+        r#"
+[server]
+listen = "127.0.0.1:8989"
+[providers.oa]
+auth = { type = "openai_oauth" }
+"#,
+    )
+    .unwrap();
+
+    let report = recover_orphan_oauth_accounts(&mut cfg, &accounts);
+
+    assert!(report.is_empty(), "{report:?}");
 }
 
 #[test]
@@ -1596,121 +998,22 @@ fn added_value_u64_parses_numbers_strings_and_rejects_invalid() {
     assert_eq!(value_u64(&payload, "missing"), None);
 }
 
-#[test]
-fn added_build_antigravity_auth_url_rejects_empty_base_url() {
-    assert!(build_antigravity_auth_url("", "state", "challenge").is_err());
-}
-
-#[test]
-fn added_generate_pkce_verifier_and_state_are_base64url_without_padding() {
-    let verifier = generate_pkce_code_verifier().unwrap();
-    let state = generate_state().unwrap();
-    assert!(!verifier.contains('='));
-    assert!(!state.contains('='));
-    assert!(verifier.len() >= 80);
-    assert!(state.len() >= 40);
-}
-
-#[test]
-fn added_random_bytes_zero_len_is_ok() {
-    assert_eq!(random_bytes(0).unwrap().len(), 0);
-}
-
-#[test]
-fn added_validate_openai_account_rejects_identical_tokens_and_bad_id_chars() {
-    let mut acc = test_openai_account("oa");
-    acc.refresh_token = acc.access_token.clone();
-    assert!(
-        validate_openai_account("oa", &acc)
-            .unwrap_err()
-            .to_string()
-            .contains("identical")
-    );
-    assert!(
-        validate_openai_account("bad.id", &test_openai_account("oa"))
-            .unwrap_err()
-            .to_string()
-            .contains("invalid account ID format")
-    );
-}
-
-#[test]
-fn added_validate_antigravity_rejects_bad_timestamps() {
-    let mut acc = test_antigravity_account("ag");
-    acc.expires_at_unix = 999_999_999;
-    assert!(
-        validate_antigravity_account("ag", &acc)
-            .unwrap_err()
-            .to_string()
-            .contains("invalid expires")
-    );
-    let mut acc = test_antigravity_account("ag");
-    acc.updated_at_unix = acc.expires_at_unix + 1;
-    assert!(
-        validate_antigravity_account("ag", &acc)
-            .unwrap_err()
-            .to_string()
-            .contains("updated_at_unix")
-    );
-}
-
 #[tokio::test]
 async fn added_refresh_account_for_provider_rejects_unknown_type() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("accounts.json");
     assert!(
-        refresh_account_for_provider(&path, "acc", "unknown")
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("unknown oauth type")
-    );
-}
-
-#[tokio::test]
-async fn added_exchange_antigravity_code_rejects_empty_code_before_http() {
-    assert!(
-        exchange_antigravity_code("http://127.0.0.1:1/token", "   ", "verifier")
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("must not be empty")
-    );
-}
-
-#[tokio::test]
-async fn antigravity_project_id_load_error_does_not_fallback_to_onboard() {
-    let app = axum::Router::new()
-        .route(
-            "/load-401",
-            axum::routing::post(|| async {
-                (axum::http::StatusCode::UNAUTHORIZED, "Unauthorized")
-            }),
+        super::token::refresh_account_for_provider_with_context_and_urls(
+            &path,
+            "acc",
+            "unknown",
+            "http://127.0.0.1:1/token",
+            super::refresh::RefreshContext::new("test-provider", "test"),
         )
-        .route(
-            "/onboard",
-            axum::routing::post(|| async {
-                axum::Json(serde_json::json!({"response": {"cloudaicompanionProject": {"id": "should-not-reach"}}}))
-            }),
-        );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
-
-    let err = super::login::fetch_antigravity_project_id(
-        &format!("http://{addr}/load-401"),
-        &format!("http://{addr}/onboard"),
-        "token",
-    )
-    .await
-    .expect_err("should fail on load 401");
-
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("not falling back to onboardUser"),
-        "got message: {msg}"
+        .unwrap_err()
+        .to_string()
+        .contains("unknown oauth type")
     );
 }
 

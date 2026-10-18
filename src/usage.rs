@@ -138,14 +138,15 @@ pub fn resolve_openai_token(cfg: &Config, auth_path: &Path, provider_id: &str) -
         .providers
         .get(provider_id)
         .with_context(|| format!("unknown provider {provider_id:?}"))?;
-    let account = match provider.auth_config(provider_id)? {
-        AuthConfig::OpenaiOauth { account } => account.unwrap_or_else(|| provider_id.to_string()),
-        AuthConfig::ApiKeyEnv { .. } | AuthConfig::None | AuthConfig::AntigravityOauth { .. } => {
+    // 分类 bail 保留（L1 分层不动）：非 OpenaiOauth 不支持 usage reset。
+    match provider.auth_config(provider_id)? {
+        AuthConfig::OpenaiOauth { .. } => {}
+        AuthConfig::ApiKeyEnv { .. } | AuthConfig::None => {
             bail!("Provider {provider_id:?} does not support usage reset.")
         }
-    };
-
-    auth::get_openai_token(auth_path, &account, provider_id)
+    }
+    // 取数面走 facade（registry 分发；账号归一化/取数/刷新同源）。
+    auth::get_token_valid(provider_id, provider, auth_path)
 }
 
 pub async fn query_usage(token: &str) -> Result<UsageStatus> {
@@ -233,15 +234,24 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("oauth_accounts.json");
         let cfg = Config {
-            server: ServerConfig {
+            server: Some(ServerConfig {
                 listen: "127.0.0.1:8989".to_string(),
                 usage: Default::default(),
                 max_sse_buffer_bytes: crate::config::default_max_sse_buffer_bytes(),
                 max_output_items: crate::config::default_max_output_items(),
-            },
+                proxy: None,
+                require_auth: None,
+                auth_token: None,
+                auth_token_env: None,
+                management_port: None,
+            }),
+            remote: None,
             fallback: Default::default(),
             protection: Default::default(),
+            diagnostics: Default::default(),
             status: Default::default(),
+            codex: Default::default(),
+            launch: Default::default(),
             providers: [
                 (
                     "openai-subscription".to_string(),
@@ -274,7 +284,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
             .as_secs() as i64;
-        let mut accounts = auth::OAuthAccounts::new();
+        let mut accounts = auth::AccountsFile::new();
         accounts.openai.insert(
             "acct".to_string(),
             auth::OpenaiAccount {

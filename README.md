@@ -6,7 +6,9 @@
 
 - **三协议互转**：OpenAI Chat ↔ Responses ↔ Anthropic Messages
 - **多 Provider 自动 Fallback**：按优先级自动切换
-- **OAuth 设备码登录**：支持 OpenAI、Google Antigravity
+- **OAuth 设备码登录**：支持主流 OAuth 上游
+- **六客户端一键接入**：Pi / Qwen Code / Claude Code / Claude Desktop / OpenCode / Codex
+- **client-only 远程模式**：客户端只消费模型与协议能力，无需本地 Provider 配置
 - **TUI 交互式配置界面**：可视化管理 Provider 和 Model
 - **内置 30+ 模型目录**：覆盖主流 coding 场景
 - **Token 用量统计**：本地 SQLite 持久化
@@ -65,12 +67,11 @@ llm-proxy launch pi
 | DeepSeek | 按量付费 | Chat, Responses, Anthropic |
 | OpenAI | 按量付费 / ChatGPT 订阅 | Chat, Responses, Anthropic |
 | Anthropic | 按量付费 | Anthropic |
-| Google Antigravity | OAuth | Chat, Responses, Anthropic |
 | OpenRouter | 按量付费 | Chat, Responses, Anthropic |
 | Kimi | 平台 / 订阅 | Chat, Responses, Anthropic |
 | MiMo (小米) | 按量付费 / Token Plan | Chat, Responses, Anthropic |
 | 智谱 | 按量付费 / Coding Plan | Chat, Responses, Anthropic |
-| 百炼 (阿里) | 按量付费 / Coding Plan | Chat, Responses, Anthropic |
+| 百炼 (阿里) | 按量付费 / Coding Plan / Token Plan 个人版 / Token Plan 团队版 | Chat, Responses, Anthropic |
 | StepFun | 按量付费 / Step Plan | Chat, Responses, Anthropic |
 | Ollama | 本地 | Chat |
 
@@ -102,7 +103,6 @@ llm-proxy --help
 - [TUI 使用指南](docs/user_guide/tui-guide.md) — 交互式界面快捷键
 - [故障排查](docs/user_guide/troubleshooting.md) — 常见问题
 - [OAuth 账户管理](docs/user_guide/user-guide-oauth-accounts.md) — 登录流程
-- [路线图](ROADMAP.md) — 版本规划
 
 ## 从源码构建
 

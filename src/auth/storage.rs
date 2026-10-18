@@ -8,12 +8,14 @@ use anyhow::{Context, Result, bail};
 use super::types::*;
 
 /// 加载 OAuth 账号（新格式），跳过无效账号并返回跳过列表
-pub fn load_oauth_accounts(path: &Path) -> Result<(OAuthAccounts, Vec<SkippedAccount>)> {
+use crate::auth::openai::schema::validate_openai_account;
+
+pub fn load_oauth_accounts(path: &Path) -> Result<(AccountsFile, Vec<SkippedAccount>)> {
     validate_path_safety(path)?;
     let data = match fs::read_to_string(path) {
         Ok(data) => data,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((OAuthAccounts::new(), Vec::new()));
+            return Ok((AccountsFile::new(), Vec::new()));
         }
         Err(err) => {
             return Err(err).with_context(|| format!("failed to read {}", path.display()));
@@ -21,7 +23,7 @@ pub fn load_oauth_accounts(path: &Path) -> Result<(OAuthAccounts, Vec<SkippedAcc
     };
     check_file_permissions(path);
 
-    let raw: OAuthAccounts = serde_json::from_str(&data)
+    let raw: AccountsFile = serde_json::from_str(&data)
         .with_context(|| format!("failed to parse {}", path.display()))?;
 
     if raw.version != 1 {
@@ -33,23 +35,8 @@ pub fn load_oauth_accounts(path: &Path) -> Result<(OAuthAccounts, Vec<SkippedAcc
     }
 
     // 逐个账号验证，跳过无效账号
-    let mut valid = OAuthAccounts::new();
+    let mut valid = AccountsFile::new();
     let mut skipped = Vec::new();
-
-    for (id, acc) in raw.antigravity {
-        match validate_antigravity_account(&id, &acc) {
-            Ok(()) => {
-                valid.antigravity.insert(id, acc);
-            }
-            Err(reason) => {
-                skipped.push(SkippedAccount {
-                    account_type: "antigravity".to_string(),
-                    account_id: id,
-                    reason: reason.to_string(),
-                });
-            }
-        }
-    }
 
     for (id, acc) in raw.openai {
         match validate_openai_account(&id, &acc) {
@@ -69,100 +56,8 @@ pub fn load_oauth_accounts(path: &Path) -> Result<(OAuthAccounts, Vec<SkippedAcc
     Ok((valid, skipped))
 }
 
-/// 验证单个 Antigravity 账号
-pub(super) fn validate_antigravity_account(id: &str, acc: &AntigravityAccount) -> Result<()> {
-    // Account ID 格式
-    if id.is_empty() {
-        bail!("account ID is empty");
-    }
-    if !id
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-    {
-        bail!("invalid account ID format");
-    }
-    if id.len() > 64 {
-        bail!("account ID too long");
-    }
-
-    // Token 不能相同
-    if acc.access_token == acc.refresh_token {
-        bail!("access_token and refresh_token are identical");
-    }
-
-    // Token 长度
-    if acc.access_token.len() < 20 {
-        bail!("access_token too short");
-    }
-    if acc.refresh_token.len() < 20 {
-        bail!("refresh_token too short");
-    }
-
-    // 时间戳合理性
-    if acc.expires_at_unix < 1000000000 {
-        bail!("invalid expires_at_unix");
-    }
-    if acc.updated_at_unix < 1000000000 {
-        bail!("invalid updated_at_unix");
-    }
-    if acc.updated_at_unix > acc.expires_at_unix {
-        bail!("updated_at_unix > expires_at_unix");
-    }
-
-    // Project ID 格式
-    let project_pattern = regex::Regex::new(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")?;
-    if !project_pattern.is_match(&acc.project_id) {
-        bail!("invalid Google Cloud project ID: {}", acc.project_id);
-    }
-
-    Ok(())
-}
-
-/// 验证单个 OpenAI 账号
-pub(super) fn validate_openai_account(id: &str, acc: &OpenaiAccount) -> Result<()> {
-    // Account ID 格式
-    if id.is_empty() {
-        bail!("account ID is empty");
-    }
-    if !id
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-    {
-        bail!("invalid account ID format");
-    }
-    if id.len() > 64 {
-        bail!("account ID too long");
-    }
-
-    // Token 不能相同
-    if acc.access_token == acc.refresh_token {
-        bail!("access_token and refresh_token are identical");
-    }
-
-    // Token 长度
-    if acc.access_token.len() < 20 {
-        bail!("access_token too short");
-    }
-    if acc.refresh_token.len() < 20 {
-        bail!("refresh_token too short");
-    }
-
-    // 时间戳合理性
-    if acc.expires_at_unix < 1000000000 {
-        bail!("invalid expires_at_unix");
-    }
-    if acc.updated_at_unix < 1000000000 {
-        bail!("invalid updated_at_unix");
-    }
-    if acc.updated_at_unix > acc.expires_at_unix {
-        bail!("updated_at_unix > expires_at_unix");
-    }
-
-    Ok(())
-}
-
 /// 加载 OAuth 账号，损坏时按 mtime 倒序遍历所有备份尝试恢复，成功后写回主文件
-pub fn load_oauth_accounts_with_recovery(path: &Path) -> Result<OAuthAccounts> {
+pub fn load_oauth_accounts_with_recovery(path: &Path) -> Result<AccountsFile> {
     match load_oauth_accounts(path) {
         Ok((accounts, skipped)) => {
             if !skipped.is_empty() {
@@ -315,7 +210,7 @@ pub(super) fn acquire_lock_with_timeout(path: &Path, timeout: Duration) -> Resul
 /// 锁覆盖整个 load→modify→save 临界区，防止跨进程丢更新。
 pub(crate) fn with_locked_accounts<T>(
     path: &Path,
-    f: impl FnOnce(&mut OAuthAccounts) -> Result<T>,
+    f: impl FnOnce(&mut AccountsFile) -> Result<T>,
 ) -> Result<T> {
     validate_path_safety(path)?;
     if let Some(parent) = path.parent() {
@@ -402,7 +297,7 @@ pub(super) fn cleanup_old_backups(path: &Path, keep: usize) -> Result<()> {
 }
 
 /// 原子写入：临时文件（0600）+ fsync + rename + 目录 fsync。调用方必须持有写锁。
-pub(crate) fn save_oauth_accounts_locked(path: &Path, accounts: &OAuthAccounts) -> Result<()> {
+pub(crate) fn save_oauth_accounts_locked(path: &Path, accounts: &AccountsFile) -> Result<()> {
     // 写入前备份现有文件
     backup_oauth_accounts(path)?;
 
@@ -440,7 +335,7 @@ pub(crate) fn save_oauth_accounts_locked(path: &Path, accounts: &OAuthAccounts) 
 }
 
 /// 保存 OAuth 账号（新格式）。自带写锁；已持锁场景请用 with_locked_accounts + save_oauth_accounts_locked。
-pub fn save_oauth_accounts(path: &Path, accounts: &OAuthAccounts) -> Result<()> {
+pub fn save_oauth_accounts(path: &Path, accounts: &AccountsFile) -> Result<()> {
     validate_path_safety(path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -453,10 +348,49 @@ pub fn save_oauth_accounts(path: &Path, accounts: &OAuthAccounts) -> Result<()> 
     save_oauth_accounts_locked(path, accounts)
 }
 
+/// 写入 pending 账号（已带写锁）
+pub(crate) fn write_pending_account_locked(path: &Path, pending: &PendingAccount) -> Result<()> {
+    with_locked_accounts(path, |accounts| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        match pending.auth_type.as_str() {
+            "openai" => {
+                accounts.openai.insert(
+                    pending.account.clone(),
+                    OpenaiAccount {
+                        account_label: pending.account.clone(),
+                        access_token: pending.access_token.clone(),
+                        refresh_token: pending.refresh_token.clone().unwrap_or_default(),
+                        expires_at_unix: pending.expires_at_unix.unwrap_or(now + 3600),
+                        updated_at_unix: now,
+                    },
+                );
+            }
+            other => bail!("unsupported OAuth type for pending account: {other}"),
+        }
+        save_oauth_accounts_locked(path, accounts)
+    })
+}
+
+#[allow(dead_code)] // used by tests via auth:: re-export
 pub fn default_state_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config")
-        .join("llm-proxy")
+    default_state_path_in(dirs::config_dir().unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".config")
+    }))
+}
+
+pub(crate) fn state_path_for_config(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
         .join("oauth_accounts.json")
+}
+
+#[allow(dead_code)] // used by tests
+pub(super) fn default_state_path_in(config_root: PathBuf) -> PathBuf {
+    config_root.join("llm-proxy").join("oauth_accounts.json")
 }

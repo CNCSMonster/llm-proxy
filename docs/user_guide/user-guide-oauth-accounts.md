@@ -13,16 +13,6 @@ llm-proxy v2 使用新的 OAuth 账号存储格式，按 OAuth 类型分组存�
 ```json
 {
   "version": 1,
-  "antigravity": {
-    "default": {
-      "account_label": "user@gmail.com",
-      "project_id": "my-project-123",
-      "access_token": "ya29.a0...",
-      "refresh_token": "1//0e...",
-      "expires_at_unix": 1785245247,
-      "updated_at_unix": 1785226019
-    }
-  },
   "openai": {
     "personal": {
       "account_label": "user@gmail.com",
@@ -39,16 +29,7 @@ llm-proxy v2 使用新的 OAuth 账号存储格式，按 OAuth 类型分组存�
 
 **顶层字段：**
 - `version`：Schema 版本号（当前为 1）
-- `antigravity`：Antigravity OAuth 账号分组
 - `openai`：OpenAI OAuth 账号分组
-
-**Antigravity 账号字段：**
-- `account_label`：账号标签（通常是邮箱）
-- `project_id`：Google Cloud 项目 ID（必需）
-- `access_token`：OAuth access token
-- `refresh_token`：OAuth refresh token
-- `expires_at_unix`：Token 过期时间（Unix 时间戳，秒）
-- `updated_at_unix`：最后更新时间（Unix 时间戳，秒，可选）
 
 **OpenAI 账号字段：**
 - `account_label`：账号标签（通常是邮箱）
@@ -78,9 +59,6 @@ llm-proxy v2 使用新的 OAuth 账号存储格式，按 OAuth 类型分组存�
 ```bash
 # 登录 OpenAI
 llm-proxy provider login openai-subscription
-
-# 登录 Antigravity
-llm-proxy provider login antigravity
 ```
 
 登录流程会自动保存凭据到 `oauth_accounts.json`。
@@ -110,14 +88,12 @@ Token 会在过期前自动刷新。如果需要手动刷新：
 
 ```bash
 llm-proxy provider refresh openai-subscription
-llm-proxy provider refresh antigravity
 ```
 
 ### 5. 登出
 
 ```bash
 llm-proxy provider logout openai-subscription
-llm-proxy provider logout antigravity
 ```
 
 ## 文件安全
@@ -142,8 +118,7 @@ llm-proxy provider logout antigravity
 
 ```
 ⚠️  Warning: OAuth accounts file not found
-   Found 2 OAuth provider(s) that require login:
-   - antigravity
+   Found 1 OAuth provider(s) that require login:
    - openai-subscription
    
    Run: llm-proxy provider login <provider>
@@ -155,8 +130,8 @@ llm-proxy provider logout antigravity
 如果使用未登录的 OAuth provider，会返回明确的错误：
 
 ```
-Provider 'antigravity' requires OAuth login
-Run: llm-proxy provider login antigravity
+Provider 'openai-subscription' requires OAuth login
+Run: llm-proxy provider login openai-subscription
 Or use TUI: llm-proxy provider
 ```
 
@@ -166,7 +141,7 @@ Or use TUI: llm-proxy provider
 
 ```
 OAuth account 'default' access token is expired
-Run: llm-proxy provider refresh antigravity or relogin
+Run: llm-proxy provider refresh openai-subscription or relogin
 ```
 
 ## 验证规则
@@ -177,15 +152,13 @@ llm-proxy 会自动验证账号数据，确保：
 2. **Token 长度**：access_token 和 refresh_token 长度 ≥20 字符
 3. **Token 不相同**：access_token 和 refresh_token 不能相同
 4. **时间戳合理性**：expires_at_unix 和 updated_at_unix 必须在合理范围内
-5. **Project ID 格式**（Antigravity）：必须符合 Google Cloud 项目 ID 格式
 
 如果验证失败，会显示详细的错误信息：
 
 ```
-Invalid antigravity account ID: invalid id with spaces
-Antigravity account test-account access_token too short
-Antigravity account test-account has identical access and refresh tokens
-Invalid Google Cloud project ID for account test: INVALID
+Invalid openai account ID: invalid id with spaces
+OpenAI account test-account access_token too short
+OpenAI account test-account has identical access and refresh tokens
 ```
 
 ## 迁移
@@ -204,7 +177,6 @@ Invalid Google Cloud project ID for account test: INVALID
 2. 重新登录所有 OAuth provider：
    ```bash
    llm-proxy provider login openai-subscription
-   llm-proxy provider login antigravity
    ```
 
 3. 验证新格式：
@@ -220,19 +192,6 @@ Invalid Google Cloud project ID for account test: INVALID
 2. 遵循字段规范
 3. 遵守 Account ID 命名约定
 4. 保存后运行 `llm-proxy auth status` 验证
-
-## antigravity 模型上游稳定性说明
-
-antigravity 提供的模型（gemini-* / claude-* / gpt-oss-*）中，**gpt-oss-120b** 存在**间歇性上游不稳定**（L1 实测，2026-08-02）：
-
-- **表现**：连续/高频请求时偶发上游 5xx（`internal_server_error`），上游返回 `"We're currently experiencing high demand, which may cause temporary errors."`。在 codex TUI 中使用 `/goal` 长任务时表现为 `Goal blocked (/goal resume)`。
-- **原因**：antigravity 服务端高负载/限流间歇触发，**非 llm-proxy 配置或转换问题**（代理日志无错误）。
-- **处理**：
-  1. 遇到 `Goal blocked` 时稍等片刻，用 `/goal resume` 恢复（codex 会重试）
-  2. 若持续失败，间隔 1-2 分钟后再试（上游会自行恢复）
-  3. 该模型单轮请求（普通对话/exec 单轮）通常正常；仅高频多轮任务易触发
-
-其余 11 个模型（gemini-*、claude-sonnet-4-6、claude-opus-4-6）验证稳定，无此问题。
 
 ## 故障排除
 
@@ -277,9 +236,9 @@ antigravity 提供的模型（gemini-* / claude-* / gpt-oss-*）中，**gpt-oss-
 
 ## 相关文档
 
-- [OAuth 账号存储设计文档](../design/oauth-accounts-storage.md)
-- [Provider 管理命令](../AGENTS.md#provider-命令)
-- [TUI 用户界面](../design/rust-v2-tui-design.md)
+- OAuth 账号存储设计文档
+- [Provider 管理命令](cli-guide.md#24-provider-管理)
+- TUI 用户界面
 
 ## 反馈
 

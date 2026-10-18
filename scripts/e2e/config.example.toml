@@ -1,0 +1,69 @@
+[server]
+listen = "127.0.0.1:8992"
+
+[providers.deepseek]
+product = "deepseek"
+api_key_env = "DEEPSEEK_API_KEY"
+reasoning_levels = [
+    {level = "minimal", api_value = "high"},
+    {level = "low", api_value = "high"},
+    {level = "medium", api_value = "high"},
+    {level = "high", api_value = "high"},
+    {level = "xhigh", api_value = "max"},
+]
+
+[providers.deepseek.openai_chat]
+url = "https://api.deepseek.com/chat/completions"
+
+[providers.deepseek.openai_chat.compat]
+supports_reasoning_effort = true
+thinking_format = "deepseek"
+requires_reasoning_content_on_assistant_messages = true
+max_tokens_field = "max_tokens"
+
+[providers.deepseek.openai_responses]
+derive_from = "openai_chat"
+
+[providers.deepseek.anthropic]
+url = "https://api.deepseek.com/anthropic/v1/messages"
+
+[models.deepseek-v4-pro-lp]
+context_window = 1000000
+max_output_tokens = 384000
+features = ["tool_call_reasoning"]
+reasoning_levels = ["none", "low", "medium", "high", "xhigh"]
+default_reasoning_level = "high"
+supports_thinking = true
+force_think = true
+
+[[models.deepseek-v4-pro-lp.openai_chat_providers]]
+name = "deepseek"
+model = "deepseek-v4-pro"
+
+[[models.deepseek-v4-pro-lp.openai_responses_providers]]
+name = "deepseek"
+model = "deepseek-v4-pro"
+
+[[models.deepseek-v4-pro-lp.anthropic_providers]]
+name = "deepseek"
+model = "deepseek-v4-pro"
+
+[models.deepseek-v4-pro-nothink-lp]
+context_window = 1000000
+max_output_tokens = 384000
+features = ["tool_call_reasoning"]
+reasoning_levels = ["none", "low", "medium", "high", "xhigh"]
+supports_thinking = true
+force_no_think = true
+
+[[models.deepseek-v4-pro-nothink-lp.openai_chat_providers]]
+name = "deepseek"
+model = "deepseek-v4-pro"
+
+[[models.deepseek-v4-pro-nothink-lp.openai_responses_providers]]
+name = "deepseek"
+model = "deepseek-v4-pro"
+
+[[models.deepseek-v4-pro-nothink-lp.anthropic_providers]]
+name = "deepseek"
+model = "deepseek-v4-pro"

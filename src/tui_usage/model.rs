@@ -108,6 +108,8 @@ pub struct UsageTuiState {
     pub cursor: usize,
     pub total_tokens: i64,
     pub total_requests: i64,
+    /// 数据加载失败信息（成功时为 None）；为空表与"加载失败"提供区分
+    pub load_error: Option<String>,
     pub filter_provider: Option<String>,
     pub filter_model: Option<String>,
     pub show_json: bool,
@@ -128,6 +130,7 @@ impl UsageTuiState {
             cursor: 0,
             total_tokens: 0,
             total_requests: 0,
+            load_error: None,
             filter_provider: None,
             filter_model: None,
             show_json: false,
@@ -143,17 +146,25 @@ impl UsageTuiState {
     pub fn load_data(&mut self) {
         let config_path = crate::config::default_config_path();
         let usage_config = if config_path.exists() {
-            crate::config::Config::load(&config_path)
-                .map(|cfg| cfg.server.usage)
-                .unwrap_or_default()
+            match crate::config::Config::load(&config_path) {
+                Ok(cfg) => cfg.server.map(|s| s.usage).unwrap_or_default(),
+                Err(err) => {
+                    self.load_error = Some(format!("无法加载配置: {err}"));
+                    return;
+                }
+            }
         } else {
             crate::config::UsageConfig::default()
         };
 
         let store = match crate::usage_stats::UsageStore::new(usage_config) {
             Ok(s) => s,
-            Err(_) => return,
+            Err(err) => {
+                self.load_error = Some(format!("无法加载 usage 数据存储: {err}"));
+                return;
+            }
         };
+        self.load_error = None;
 
         let (start, end) = self.period.to_range();
         let start_dt = start.and_then(|ts| DateTime::from_timestamp(ts, 0));

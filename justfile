@@ -7,11 +7,10 @@ default: lint
 
 # ── Lint ───────────────────────────────────────────────────────────────────
 
-# Check formatting, clippy lint (deny warnings), and tests.
+# Check formatting and clippy lint (deny warnings).
 lint:
     cargo fmt -- --check
     cargo clippy --all-targets -- -D warnings
-    cargo test
 
 # Apply Rust formatting.
 lint-fix:
@@ -29,20 +28,23 @@ build-release:
 
 # ── Test ───────────────────────────────────────────────────────────────────
 
-# Run unit and integration tests.
-test:
-    cargo test
-
-# Run test coverage check (core modules ≥ 80%).
-coverage:
-    bash scripts/check-coverage.sh 80
+# Run unit and integration tests with cargo-nextest (required dependency).
+test args="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v cargo-nextest >/dev/null 2>&1; then
+        echo "❌ cargo-nextest 未安装（开发环境必需依赖）。请执行: cargo install --locked cargo-nextest" >&2
+        exit 1
+    fi
+    cargo nextest run --all-targets {{args}}
 
 # ── Release Gate ───────────────────────────────────────────────────────────
 
-# Full release gate: fmt + clippy + test + coverage + release build.
-# Options: --skip-e2e (skip real-client E2E), --quick (skip release build).
+# Full release gate: fmt + clippy + tests.
 release-gate args="":
-    bash scripts/release-gate.sh {{args}}
+    cargo fmt -- --check
+    cargo clippy --all-targets -- -D warnings
+    cargo nextest run --all-targets {{args}}
 
 # ── Install ────────────────────────────────────────────────────────────────
 

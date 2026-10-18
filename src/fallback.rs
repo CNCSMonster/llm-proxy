@@ -176,10 +176,10 @@ pub fn add_fallback(
         .any(|r| matches!(r, FallbackBindingResult::Inserted { .. }));
     if has_insertions {
         // Acquire cross-process file lock (same as model.rs write path)
-        let _lock = crate::core::ConfigLock::acquire(
-            &crate::service::state_dir(),
-            std::time::Duration::from_secs(5),
-        )?;
+        let config_dir = path.parent().unwrap_or(std::path::Path::new("."));
+        let dirs = crate::service::StateDirs::resolve(config_dir);
+        let _lock =
+            crate::core::ConfigLock::acquire(&dirs.runtime_dir, std::time::Duration::from_secs(5))?;
         crate::config_edit::write_full_config(path, &cfg)?;
     }
 
@@ -363,7 +363,6 @@ fn protocol_short_name(protocol: Protocol) -> &'static str {
         Protocol::OpenaiChatCompletions => "chat",
         Protocol::OpenaiResponses => "responses",
         Protocol::Anthropic => "anthropic",
-        Protocol::Antigravity => "antigravity",
     }
 }
 
@@ -375,7 +374,6 @@ fn provider_bindings_mut(
         Protocol::OpenaiChatCompletions => &mut model.openai_chat_providers,
         Protocol::OpenaiResponses => &mut model.openai_responses_providers,
         Protocol::Anthropic => &mut model.anthropic_providers,
-        Protocol::Antigravity => unreachable!("antigravity is not a client protocol"),
     }
 }
 

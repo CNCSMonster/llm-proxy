@@ -1,6 +1,6 @@
 [package]
 name = "llm-proxy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [features]
@@ -26,7 +26,8 @@ httpdate = "1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 libc = "0.2"
-ratatui = "0.29"
+# unstable-rendered-line-info: Paragraph::line_count（tui_doc 滚动 clamp 需要 wrap 感知行数）
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -36,7 +37,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 tokio-stream = "0.1"
 toml = "0.9"
 toml_edit = "0.23"
@@ -44,10 +45,25 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+rand = "0.10.2"
+subtle = "2.6.1"
+jsonc-parser = { version = "0.34.0", features = ["cst", "serde"] }
+dashmap = "6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
+[target.'cfg(not(windows))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [dev-dependencies]
+proptest = "1"
 serial_test = "4.0.1"
 tempfile = "3"
+
+# release 构建 profile：LTO 全量 + 单编译单元（体积 −28%，
+# 延迟两档贡献在噪声内——主要延迟收益来自部署侧 target-cpu=x86-64-v3，见部署指导）
+# 代价：release 构建 ~40s → ~3min；低内存构建机降级：CARGO_PROFILE_RELEASE_LTO=thin
+[profile.release]
+lto = "fat"
+codegen-units = 1

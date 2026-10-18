@@ -15,10 +15,10 @@ pub struct QueryCache {
 }
 
 impl QueryCache {
-    /// 缓存目录：state_dir/query-cache（与 pid/sock/cooldowns/usage 同目录族）。
-    pub fn new() -> Self {
+    /// 缓存目录：使用显式 state_dir（per-instance 路径）。
+    pub fn new_in(state_dir: &std::path::Path) -> Self {
         Self {
-            dir: crate::service::state_dir().join("query-cache"),
+            dir: state_dir.join("query-cache"),
         }
     }
 

@@ -259,11 +259,7 @@ pub(super) fn style(text: &str, code: &str) -> String {
 }
 
 pub(super) fn color_enabled() -> bool {
-    if std::env::var_os("NO_COLOR").is_some() {
-        return false;
-    }
-    std::env::var_os("CLICOLOR_FORCE").is_some_and(|value| value != "0")
-        || std::io::stdout().is_terminal()
+    std::io::stdout().is_terminal()
 }
 
 pub(super) fn protocol_label(protocol_key: &str) -> &str {
