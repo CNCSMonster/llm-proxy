@@ -203,11 +203,19 @@ fn management_channel_answers_at(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     const PROBE_BUDGET: Duration = Duration::from_millis(200);
 
-    let socket =
-        match unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) } {
-            fd if fd >= 0 => unsafe { OwnedFd::from_raw_fd(fd) },
-            _ => return false,
-        };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let socket_type = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let socket_type = libc::SOCK_STREAM;
+
+    let socket = match unsafe { libc::socket(libc::AF_UNIX, socket_type, 0) } {
+        fd if fd >= 0 => unsafe { OwnedFd::from_raw_fd(fd) },
+        _ => return false,
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    if unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        return false;
+    }
     if unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } != 0 {
         return false;
     }
@@ -665,14 +673,27 @@ fn acquire_server_ownership_in(
 pub fn shutdown_background(config_path: &Path) -> Result<()> {
     let config_dir = config_path.parent().unwrap_or(Path::new("."));
     let dirs = StateDirs::resolve(config_dir);
-    shutdown_background_in(&dirs.runtime_dir)
+    shutdown_background_in(&dirs.runtime_dir, Some(config_path))
 }
 
-fn shutdown_background_in(runtime_dir: &Path) -> Result<()> {
+fn shutdown_background_in(runtime_dir: &Path, config_path: Option<&Path>) -> Result<()> {
     let pid_path = pid_path_in(runtime_dir);
     let socket_path = socket_path_in(runtime_dir);
 
-    if send_management_shutdown_in(runtime_dir).is_ok() {
+    #[cfg(unix)]
+    let management_shutdown = {
+        let _ = config_path;
+        send_management_shutdown_in(runtime_dir)
+    };
+    #[cfg(not(unix))]
+    let management_shutdown = match config_path {
+        Some(path) => send_management_shutdown(path),
+        None => Err(anyhow::anyhow!(
+            "management shutdown requires a config path"
+        )),
+    };
+
+    if management_shutdown.is_ok() {
         // The management channel only *schedules* shutdown. Confirm the process
         // actually exited before claiming success or removing its pid/socket:
         // a live process left behind keeps the ownership lock and makes the
@@ -3138,14 +3159,16 @@ mod tests {
     #[test]
     fn shutdown_background_missing_pid_file_is_ok_when_no_socket() {
         let temp = tempfile::tempdir().expect("tempdir");
-        shutdown_background_in(temp.path()).expect("not running is ok");
+        shutdown_background_in(temp.path(), None).expect("not running is ok");
     }
 
     #[test]
     fn shutdown_background_rejects_invalid_pid_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(pid_path_in(temp.path()), "invalid\n").unwrap();
-        let err = shutdown_background_in(temp.path()).unwrap_err().to_string();
+        let err = shutdown_background_in(temp.path(), None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("invalid pid file"));
     }
 
@@ -3236,7 +3259,7 @@ mod tests {
         fs::write(pid_path_in(temp.path()), format!("{pid}\n")).unwrap();
 
         // No management socket in the temp dir ⇒ the fallback path runs.
-        let result = shutdown_background_in(temp.path());
+        let result = shutdown_background_in(temp.path(), None);
 
         // Reap unconditionally so a failure cannot leave a zombie behind.
         let _ = child.kill();
